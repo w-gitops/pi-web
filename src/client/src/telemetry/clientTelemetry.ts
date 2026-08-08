@@ -129,7 +129,9 @@ export class ClientTelemetry {
   }
 
   finishApi(observation: ApiTelemetryObservation | undefined, outcome: ApiTelemetryOutcome, status?: number): void {
-    if (observation === undefined || !this.isCollecting()) return;
+    // Successful server requests are already represented by server spans. Keep
+    // browser intake focused on failures to bound volume on active clients.
+    if (observation === undefined || outcome === "success" || !this.isCollecting()) return;
     this.enqueue({
       type: "api",
       requestId: observation.requestId,

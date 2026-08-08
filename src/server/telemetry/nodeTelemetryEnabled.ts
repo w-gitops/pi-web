@@ -1,13 +1,14 @@
-import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
 import { logs } from "@opentelemetry/api-logs";
 import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-proto";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { HttpInstrumentation } from "@opentelemetry/instrumentation-http";
+import { UndiciInstrumentation } from "@opentelemetry/instrumentation-undici";
 import { envDetector, resourceFromAttributes } from "@opentelemetry/resources";
 import { BatchLogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { clientRequestIdAttributes, isClientTelemetryIntakePath, selectPrivacySafeInstrumentations, type NodeTelemetryConfig } from "./config.js";
+import { clientRequestIdAttributes, isClientTelemetryIntakePath, type NodeTelemetryConfig } from "./config.js";
 import { configureExplicitTelemetryLogEmitter } from "./logs.js";
 import { PrivacySpanExporter } from "./privacySpanExporter.js";
 import { boundedTelemetryShutdown } from "./shutdown.js";
@@ -33,13 +34,16 @@ export function startEnabledNodeTelemetry(config: NodeTelemetryConfig, env: Node
       scheduledDelayMillis: 1_000,
       exportTimeoutMillis: config.exporterTimeoutMillis,
     })],
-    instrumentations: [selectPrivacySafeInstrumentations(getNodeAutoInstrumentations({
-      "@opentelemetry/instrumentation-http": {
+    // Instantiate only the two reviewed transport instrumentations. Loading the
+    // auto-instrumentations bundle can patch Pino and export application logs.
+    instrumentations: [
+      new HttpInstrumentation({
         ignoreIncomingRequestHook: (request) => isClientTelemetryIntakePath(request.url),
         ignoreOutgoingRequestHook: (request) => isClientTelemetryIntakePath(request.path),
         startIncomingSpanHook: (request) => clientRequestIdAttributes(request.headers["x-pi-web-request-id"]),
-      },
-    }))],
+      }),
+      new UndiciInstrumentation(),
+    ],
   });
   sdk.start();
   const logger = logs.getLogger("pi-web.telemetry");

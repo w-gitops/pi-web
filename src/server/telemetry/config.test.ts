@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { captureNodeTelemetryConfig, clientRequestIdAttributes, isClientTelemetryIntakePath, selectPrivacySafeInstrumentations, telemetryEnabled } from "./config.js";
+import { captureNodeTelemetryConfig, clientRequestIdAttributes, isClientTelemetryIntakePath, telemetryEnabled } from "./config.js";
 
 describe("node telemetry configuration", () => {
   it.each(["1", "true"])("enables only the exact opt-in value %s", (value) => {
@@ -47,13 +47,5 @@ describe("node telemetry configuration", () => {
     expect(clientRequestIdAttributes("0".repeat(32))).toEqual({});
     expect(clientRequestIdAttributes([requestId])).toEqual({});
     expect(clientRequestIdAttributes("/private/session?id=secret")).toEqual({});
-  });
-
-  it("allows only HTTP transports and drops Pino, filesystem, network, and model instrumentation", () => {
-    const instrumentations = ["http", "undici", "pino", "fs", "dns", "net", "openai", "aws-sdk"].map((name) => ({ instrumentationName: `@opentelemetry/instrumentation-${name}` }));
-    expect(selectPrivacySafeInstrumentations(instrumentations).map((item) => item.instrumentationName)).toEqual([
-      "@opentelemetry/instrumentation-http",
-      "@opentelemetry/instrumentation-undici",
-    ]);
   });
 });
