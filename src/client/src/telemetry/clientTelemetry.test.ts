@@ -62,6 +62,17 @@ describe("ClientTelemetry", () => {
     expect(rawFetch).toHaveBeenCalledOnce();
   });
 
+  it("does not send successful API observations through browser intake", async () => {
+    const rawFetch = vi.fn<RawFetch>().mockResolvedValue(jsonResponse({ enabled: true }));
+    const telemetry = createTelemetry(rawFetch);
+    await telemetry.start();
+
+    telemetry.finishApi(telemetry.beginApi("session.list", "GET"), "success", 200);
+    await vi.runAllTimersAsync();
+
+    expect(rawFetch).toHaveBeenCalledOnce();
+  });
+
   it("uses a separate bounded transport and never serializes free-form failure text", async () => {
     const rawFetch = vi.fn<RawFetch>()
       .mockResolvedValueOnce(jsonResponse({ enabled: true }))

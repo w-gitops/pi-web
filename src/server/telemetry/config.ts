@@ -27,8 +27,8 @@ export function captureNodeTelemetryConfig(env: NodeJS.ProcessEnv, defaultServic
   });
 }
 
-export function isClientTelemetryIntakePath(url: string | undefined): boolean {
-  if (url === undefined) return false;
+export function isClientTelemetryIntakePath(url: string | null | undefined): boolean {
+  if (url === undefined || url === null) return false;
   let pathname: string;
   try {
     pathname = new URL(url, "http://pi-web.invalid").pathname;
@@ -41,15 +41,6 @@ export function isClientTelemetryIntakePath(url: string | undefined): boolean {
 
 export function clientRequestIdAttributes(value: string | string[] | undefined): Record<string, string> {
   return typeof value === "string" && /^(?!0{32}$)[0-9a-f]{32}$/.test(value) ? { "client.request.id": value } : {};
-}
-
-interface NamedInstrumentation {
-  readonly instrumentationName: string;
-}
-
-export function selectPrivacySafeInstrumentations<T extends NamedInstrumentation>(instrumentations: T[]): T[] {
-  const allowed = new Set(["@opentelemetry/instrumentation-http", "@opentelemetry/instrumentation-undici"]);
-  return instrumentations.filter((instrumentation) => allowed.has(instrumentation.instrumentationName));
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {
