@@ -3,6 +3,7 @@ import { WorkspaceController } from "../controllers/workspaceController";
 import { PiWebApp } from "./PiWebApp";
 
 type RefreshCallback = () => void | Promise<void>;
+type NetworkOnlineCallback = () => void;
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -10,6 +11,27 @@ afterEach(() => {
 });
 
 describe("PiWebApp workspace topology refresh wiring", () => {
+  it("reconnects selected, background, and selected-session transports when the browser reports online", () => {
+    const app = createApp();
+    const selectedRealtime = { reconnect: vi.fn() };
+    const backgroundRealtimeA = { reconnect: vi.fn() };
+    const backgroundRealtimeB = { reconnect: vi.fn() };
+    const selectedSession = { reconnectActiveSession: vi.fn() };
+    Reflect.set(app, "realtime", selectedRealtime);
+    Reflect.set(app, "machineRealtimeSockets", new Map([
+      ["machine-a", backgroundRealtimeA],
+      ["machine-b", backgroundRealtimeB],
+    ]));
+    Reflect.set(app, "sessions", selectedSession);
+
+    browserNetworkOnline(app)();
+
+    expect(selectedRealtime.reconnect).toHaveBeenCalledOnce();
+    expect(backgroundRealtimeA.reconnect).toHaveBeenCalledOnce();
+    expect(backgroundRealtimeB.reconnect).toHaveBeenCalledOnce();
+    expect(selectedSession.reconnectActiveSession).toHaveBeenCalledOnce();
+  });
+
   it("re-lists the selected project's workspaces on the browser-resume refresh", async () => {
     const app = createApp();
     stubBackgroundRefreshes(app);
@@ -93,6 +115,16 @@ function browserResumeRefresh(app: PiWebApp): RefreshCallback {
   return refresh;
 }
 
+function browserNetworkOnline(app: PiWebApp): () => void {
+  const resume: unknown = Reflect.get(app, "browserResume");
+  if (typeof resume !== "object" || resume === null) throw new Error("PiWebApp BrowserResumeController was unavailable");
+  const callbacks: unknown = Reflect.get(resume, "callbacks");
+  if (typeof callbacks !== "object" || callbacks === null) throw new Error("Browser resume callbacks were unavailable");
+  const online: unknown = Reflect.get(callbacks, "onNetworkOnline");
+  if (!isNetworkOnlineCallback(online)) throw new Error("The browser network-online callback was unavailable");
+  return online;
+}
+
 async function refreshAppData(app: PiWebApp): Promise<void> {
   const refresh: unknown = Reflect.get(app, "refreshAppData");
   if (!isRefreshCallback(refresh)) throw new Error("PiWebApp.refreshAppData is not callable");
@@ -100,5 +132,9 @@ async function refreshAppData(app: PiWebApp): Promise<void> {
 }
 
 function isRefreshCallback(value: unknown): value is RefreshCallback {
+  return typeof value === "function";
+}
+
+function isNetworkOnlineCallback(value: unknown): value is NetworkOnlineCallback {
   return typeof value === "function";
 }

@@ -11,6 +11,7 @@ interface ScheduledFrame {
 
 export interface BrowserResumeCallbacks {
   onResumeSignal(): void;
+  onNetworkOnline(): void;
   refreshAfterResume(): void | Promise<void>;
   onRefreshError(error: unknown): void;
 }
@@ -43,6 +44,7 @@ export class BrowserResumeController {
     if (this.connected) return;
     this.connected = true;
     this.windowTarget?.addEventListener("focus", this.onFocus);
+    this.windowTarget?.addEventListener("online", this.onOnline);
     this.documentTarget?.addEventListener("visibilitychange", this.onVisibilityChange);
   }
 
@@ -50,6 +52,7 @@ export class BrowserResumeController {
     if (!this.connected) return;
     this.connected = false;
     this.windowTarget?.removeEventListener("focus", this.onFocus);
+    this.windowTarget?.removeEventListener("online", this.onOnline);
     this.documentTarget?.removeEventListener("visibilitychange", this.onVisibilityChange);
     this.scheduledRefresh?.cancel();
     this.scheduledRefresh = undefined;
@@ -61,6 +64,11 @@ export class BrowserResumeController {
 
   private readonly onVisibilityChange: EventListener = () => {
     if (this.isDocumentVisible()) this.handleResumeSignal();
+  };
+
+  private readonly onOnline: EventListener = () => {
+    this.callbacks.onNetworkOnline();
+    this.handleResumeSignal();
   };
 
   private handleResumeSignal(): void {

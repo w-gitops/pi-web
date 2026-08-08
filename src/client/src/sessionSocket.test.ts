@@ -292,27 +292,35 @@ describe("socket stream validation", () => {
 class FakeWebSocket {
   static readonly CONNECTING = 0;
   static readonly instances: FakeWebSocket[] = [];
+  static constructionFailures = 0;
 
   readyState = 1;
+  closeCalls = 0;
   onopen: (() => void) | null = null;
   onmessage: ((event: { data: MessageEvent["data"] }) => void) | null = null;
   onerror: (() => void) | null = null;
   onclose: (() => void) | null = null;
 
   constructor(readonly url: string) {
+    if (FakeWebSocket.constructionFailures > 0) {
+      FakeWebSocket.constructionFailures -= 1;
+      throw new TypeError("WebSocket construction failed");
+    }
     FakeWebSocket.instances.push(this);
   }
 
   close(): void {
+    this.closeCalls += 1;
     this.readyState = 3;
   }
 }
 
 describe("socket instance isolation", () => {
-  const setTimeoutSpy = vi.fn(() => 1);
+  const setTimeoutSpy = vi.fn<(callback: () => void, delay?: number) => number>(() => 1);
 
   beforeEach(() => {
     FakeWebSocket.instances.length = 0;
+    FakeWebSocket.constructionFailures = 0;
     setTimeoutSpy.mockClear();
     vi.stubGlobal("WebSocket", FakeWebSocket);
     vi.stubGlobal("document", { baseURI: "https://pi.example.test/" });
@@ -385,5 +393,162 @@ describe("socket instance isolation", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(newHandler).toHaveBeenCalledOnce();
+  });
+
+  it("atomically replaces a session socket and rejects every stale callback", async () => {
+    const socket = new SessionSocket();
+    const onEvent = vi.fn();
+    const onReconnect = vi.fn();
+    const onInitialOpen = vi.fn();
+    socket.connect({ id: "session-1", cwd: "/repo" }, onEvent, onReconnect, "machine-a", onInitialOpen);
+    const oldSocket = FakeWebSocket.instances[0];
+    if (oldSocket === undefined) throw new Error("expected initial session socket");
+    const staleOpen = oldSocket.onopen;
+    const staleMessage = oldSocket.onmessage;
+    const staleError = oldSocket.onerror;
+    const staleClose = oldSocket.onclose;
+    staleOpen?.();
+    expect(onInitialOpen).toHaveBeenCalledOnce();
+
+    socket.reconnect();
+
+    expect(oldSocket.closeCalls).toBe(1);
+    expect(oldSocket.onopen).toBeNull();
+    expect(oldSocket.onmessage).toBeNull();
+    expect(oldSocket.onerror).toBeNull();
+    expect(oldSocket.onclose).toBeNull();
+    staleOpen?.();
+    staleMessage?.({ data: JSON.stringify(inboxEvent()) });
+    staleError?.();
+    staleClose?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(oldSocket.closeCalls).toBe(1);
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(onReconnect).not.toHaveBeenCalled();
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
+
+    const replacement = FakeWebSocket.instances[1];
+    if (replacement === undefined) throw new Error("expected replacement session socket");
+    replacement.onopen?.();
+    expect(onInitialOpen).toHaveBeenCalledOnce();
+    expect(onReconnect).toHaveBeenCalledOnce();
+  });
+
+  it("atomically replaces a realtime socket and rejects every stale callback", async () => {
+    const socket = new RealtimeSocket();
+    const onEvent = vi.fn();
+    const onOpen = vi.fn();
+    const event = { type: "workspace.activity", activity: workspaceActivityWire() };
+    socket.connect(onEvent, onOpen, "machine-a");
+    const oldSocket = FakeWebSocket.instances[0];
+    if (oldSocket === undefined) throw new Error("expected initial realtime socket");
+    const staleOpen = oldSocket.onopen;
+    const staleMessage = oldSocket.onmessage;
+    const staleError = oldSocket.onerror;
+    const staleClose = oldSocket.onclose;
+
+    socket.reconnect();
+    staleOpen?.();
+    staleMessage?.({ data: JSON.stringify(event) });
+    staleError?.();
+    staleClose?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(oldSocket.closeCalls).toBe(1);
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
+    const replacement = FakeWebSocket.instances[1];
+    if (replacement === undefined) throw new Error("expected replacement realtime socket");
+    replacement.onopen?.();
+    replacement.onmessage?.({ data: JSON.stringify(event) });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onOpen).toHaveBeenCalledOnce();
+    expect(onEvent).toHaveBeenCalledOnce();
+  });
+
+  it("closes a replaced connecting socket after its handshake finishes", () => {
+    const socket = new SessionSocket();
+    socket.connect({ id: "session-1", cwd: "/repo" }, () => undefined);
+    const connecting = FakeWebSocket.instances[0];
+    if (connecting === undefined) throw new Error("expected connecting session socket");
+    connecting.readyState = FakeWebSocket.CONNECTING;
+
+    socket.reconnect();
+
+    expect(connecting.closeCalls).toBe(0);
+    const cleanupOpen = connecting.onopen;
+    if (cleanupOpen === null) throw new Error("expected connecting-socket cleanup callback");
+    cleanupOpen();
+    expect(connecting.closeCalls).toBe(1);
+    expect(connecting.onopen).toBeNull();
+  });
+
+  it("invalidates queued backoff when a forced session reconnect opens immediately", () => {
+    const socket = new SessionSocket();
+    socket.connect({ id: "session-1", cwd: "/repo" }, () => undefined);
+    const initial = FakeWebSocket.instances[0];
+    if (initial === undefined) throw new Error("expected initial session socket");
+    initial.onclose?.();
+    const queuedReconnect = setTimeoutSpy.mock.calls[0]?.[0];
+    if (queuedReconnect === undefined) throw new Error("expected queued reconnect");
+
+    socket.reconnect();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    queuedReconnect();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    socket.close();
+    socket.reconnect();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it("invalidates queued backoff when a forced realtime reconnect opens immediately", () => {
+    const socket = new RealtimeSocket();
+    socket.connect(() => undefined);
+    const initial = FakeWebSocket.instances[0];
+    if (initial === undefined) throw new Error("expected initial realtime socket");
+    initial.onclose?.();
+    const queuedReconnect = setTimeoutSpy.mock.calls[0]?.[0];
+    if (queuedReconnect === undefined) throw new Error("expected queued reconnect");
+
+    socket.reconnect();
+    socket.reconnect();
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    queuedReconnect();
+    expect(FakeWebSocket.instances).toHaveLength(3);
+
+    socket.close();
+    socket.reconnect();
+    expect(FakeWebSocket.instances).toHaveLength(3);
+  });
+
+  it("backs off after synchronous WebSocket construction failures", () => {
+    FakeWebSocket.constructionFailures = 1;
+    const socket = new RealtimeSocket();
+    socket.connect(() => undefined);
+
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(setTimeoutSpy).toHaveBeenCalledOnce();
+    const queuedReconnect = setTimeoutSpy.mock.calls[0]?.[0];
+    if (queuedReconnect === undefined) throw new Error("expected queued reconnect");
+    queuedReconnect();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("backs off a session socket after synchronous WebSocket construction failures", () => {
+    FakeWebSocket.constructionFailures = 1;
+    const socket = new SessionSocket();
+    socket.connect({ id: "session-1", cwd: "/repo" }, () => undefined);
+
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(setTimeoutSpy).toHaveBeenCalledOnce();
+    const queuedReconnect = setTimeoutSpy.mock.calls[0]?.[0];
+    if (queuedReconnect === undefined) throw new Error("expected queued reconnect");
+    queuedReconnect();
+    expect(FakeWebSocket.instances).toHaveLength(1);
   });
 });

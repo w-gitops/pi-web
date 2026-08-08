@@ -34,10 +34,12 @@ describe("BrowserResumeController", () => {
     const refreshStarted = deferred<undefined>();
     const refreshCompleted = deferred<undefined>();
     const onResumeSignal = vi.fn();
+    const onNetworkOnline = vi.fn();
     let visible = true;
     let refreshCalls = 0;
     const controller = new BrowserResumeController({
       onResumeSignal,
+      onNetworkOnline,
       refreshAfterResume: async () => {
         refreshCalls += 1;
         refreshStarted.resolve(undefined);
@@ -58,6 +60,7 @@ describe("BrowserResumeController", () => {
     windowTarget.dispatchEvent(new Event("focus"));
 
     expect(onResumeSignal).toHaveBeenCalledTimes(3);
+    expect(onNetworkOnline).not.toHaveBeenCalled();
     expect(frames.pendingCount()).toBe(1);
     expect(refreshCalls).toBe(0);
 
@@ -94,6 +97,7 @@ describe("BrowserResumeController", () => {
     let refreshCalls = 0;
     const controller = new BrowserResumeController({
       onResumeSignal: () => undefined,
+      onNetworkOnline: () => undefined,
       refreshAfterResume: async () => {
         refreshCalls += 1;
         if (refreshCalls === 1) {
@@ -131,5 +135,36 @@ describe("BrowserResumeController", () => {
     secondGate.resolve(undefined);
     await secondCompleted.promise;
     controller.disconnect();
+  });
+
+  it("recovers transports immediately on online and batches its refresh even while hidden", async () => {
+    const windowTarget = new EventTarget();
+    const documentTarget = new EventTarget();
+    const frames = frameHarness();
+    const calls: string[] = [];
+    const controller = new BrowserResumeController({
+      onNetworkOnline: () => { calls.push("online"); },
+      onResumeSignal: () => { calls.push("resume"); },
+      refreshAfterResume: () => { calls.push("refresh"); },
+      onRefreshError: (error) => { throw error; },
+    }, {
+      windowTarget,
+      documentTarget,
+      isDocumentVisible: () => false,
+      scheduleFrame: frames.scheduleFrame,
+    });
+    controller.connect();
+
+    windowTarget.dispatchEvent(new Event("online"));
+
+    expect(calls).toEqual(["online", "resume"]);
+    expect(frames.pendingCount()).toBe(1);
+    frames.runNext();
+    await Promise.resolve();
+    expect(calls).toEqual(["online", "resume", "refresh"]);
+
+    controller.disconnect();
+    windowTarget.dispatchEvent(new Event("online"));
+    expect(calls).toEqual(["online", "resume", "refresh"]);
   });
 });
