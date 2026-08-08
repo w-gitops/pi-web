@@ -33,6 +33,9 @@ import { registerMachineRoutes } from "./machines/machineRoutes.js";
 import { registerMachineProxyRoutes } from "./machines/machineProxyRoutes.js";
 import { proxyMachinePluginAsset, registerMachinePluginProxyRoutes } from "./machines/machinePluginProxyRoutes.js";
 import type { Project, Workspace, WorkspaceEffectiveConfig } from "./types.js";
+import { telemetryEnabled } from "./telemetry/config.js";
+import { registerClientTelemetryIntake, type ClientTelemetryIntakeOptions } from "./telemetry/clientTelemetryIntake.js";
+import { registerFastifyTelemetryHooks } from "./telemetry/fastifyTelemetry.js";
 
 export interface AppDependencies {
   projects?: ProjectService;
@@ -48,6 +51,7 @@ export interface AppDependencies {
   logger?: FastifyServerOptions["logger"];
   /** Maximum accepted HTTP request body size in bytes. */
   bodyLimit?: number;
+  clientTelemetry?: ClientTelemetryIntakeOptions;
 }
 
 interface LocalProjectRouteOptions {
@@ -139,6 +143,8 @@ export async function buildApp(deps: AppDependencies = {}): Promise<FastifyInsta
     threshold: 1024,
   });
   await app.register(fastifyWebsocket);
+  registerFastifyTelemetryHooks(app);
+  registerClientTelemetryIntake(app, deps.clientTelemetry ?? { enabled: telemetryEnabled(process.env) });
 
   const projects = deps.projects ?? new ProjectService(new ProjectStore());
   const workspaces = deps.workspaces ?? new WorkspaceService();
