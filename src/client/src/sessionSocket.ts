@@ -1,6 +1,7 @@
 import { realtimeEvents, sessionEvents } from "./api";
 import { parseRealtimeStreamEvent, parseSessionAskClosedEvent, parseSessionAskOpenedEvent, parseSessionDialogClosedEvent, parseSessionDialogOpenedEvent, parseSessionNotificationInboxEvent, parseSessionStartupProgressEvent, parseSessionStreamEvent, parseSessionUnreadEvent } from "./api/parsers";
 import type { RealtimeEvent, SessionRef, SessionUiEvent } from "../../shared/apiTypes";
+import { newTelemetryId, recordSocketTelemetry } from "./telemetry/clientTelemetry";
 
 export type { GlobalSessionEvent, RealtimeEvent, SessionUiEvent } from "../../shared/apiTypes";
 
@@ -18,6 +19,7 @@ export class SessionSocket {
   private onInitialOpen: (() => void) | undefined;
   private machineId = "local";
   private generation = 0;
+  private attempt: SocketAttempt | undefined;
 
   connect(
     session: SessionRef,
@@ -42,6 +44,7 @@ export class SessionSocket {
 
   reconnect(): void {
     if (!this.shouldReconnect) return;
+    this.reportReplacement();
     const generation = ++this.generation;
     window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
@@ -64,21 +67,26 @@ export class SessionSocket {
     this.onInitialOpen = undefined;
     this.hasOpened = false;
     this.machineId = "local";
+    this.attempt = undefined;
   }
 
   private open(generation = this.generation): void {
     const session = this.session;
     if (generation !== this.generation || session === undefined || session.id === "" || session.cwd === "" || !this.shouldReconnect) return;
+    const attempt: SocketAttempt = { id: newTelemetryId(), generation, opened: false, hadError: false };
+    this.attempt = attempt;
     let socket: WebSocket;
     try {
       socket = sessionEvents(session, this.machineId);
     } catch {
-      this.scheduleReconnect(generation);
+      this.scheduleReconnect(generation, attempt, "scheduled");
       return;
     }
     this.socket = socket;
     socket.onopen = () => {
       if (!this.isCurrentSocket(socket, generation)) return;
+      attempt.opened = true;
+      recordAttemptTelemetry("session", attempt, { outcome: "open" });
       this.reconnectDelay = 500;
       const isReconnect = this.hasOpened;
       this.hasOpened = true;
@@ -89,20 +97,29 @@ export class SessionSocket {
       if (this.isCurrentSocket(socket, generation)) void this.handleMessage(message.data, socket, session, generation);
     };
     socket.onerror = () => {
-      if (this.isCurrentSocket(socket, generation)) socket.close();
+      if (this.isCurrentSocket(socket, generation)) {
+        attempt.hadError = true;
+        socket.close();
+      }
     };
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (!this.isCurrentSocket(socket, generation)) return;
       this.socket = undefined;
-      this.scheduleReconnect(generation);
+      const outcomeAttempt = attempt.opened ? { ...attempt, id: newTelemetryId(), opened: false } : attempt;
+      this.scheduleReconnect(generation, outcomeAttempt, attempt.hadError ? "error" : "close", closeCode(event));
     };
   }
 
-  private scheduleReconnect(generation: number): void {
+  private scheduleReconnect(generation: number, attempt: SocketAttempt, outcome: "close" | "error" | "scheduled", closeCodeValue?: number): void {
     if (!this.shouldReconnect || generation !== this.generation) return;
     window.clearTimeout(this.reconnectTimer);
     const delay = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 1.6, 5000);
+    recordAttemptTelemetry("session", attempt, {
+      outcome,
+      ...(closeCodeValue === undefined ? {} : { closeCode: closeCodeValue }),
+      delayMs: delay,
+    });
     this.reconnectTimer = window.setTimeout(() => {
       if (!this.shouldReconnect || generation !== this.generation) return;
       this.reconnectTimer = undefined;
@@ -120,6 +137,11 @@ export class SessionSocket {
   private isCurrentSocket(socket: WebSocket, generation: number): boolean {
     return this.shouldReconnect && generation === this.generation && this.socket === socket;
   }
+
+  private reportReplacement(): void {
+    if (this.attempt === undefined || this.socket === undefined) return;
+    recordAttemptTelemetry("session", { ...this.attempt, id: newTelemetryId() }, { outcome: "replaced" });
+  }
 }
 
 export class RealtimeSocket {
@@ -131,6 +153,7 @@ export class RealtimeSocket {
   private shouldReconnect = false;
   private machineId = "local";
   private generation = 0;
+  private attempt: SocketAttempt | undefined;
 
   connect(onEvent: (event: BrowserRealtimeEvent) => void, onOpen?: () => void, machineId = "local"): void {
     this.close();
@@ -143,6 +166,7 @@ export class RealtimeSocket {
 
   reconnect(): void {
     if (!this.shouldReconnect) return;
+    this.reportReplacement();
     const generation = ++this.generation;
     window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
@@ -162,20 +186,25 @@ export class RealtimeSocket {
     this.onEvent = undefined;
     this.onOpen = undefined;
     this.machineId = "local";
+    this.attempt = undefined;
   }
 
   private open(generation = this.generation): void {
     if (!this.shouldReconnect || generation !== this.generation) return;
+    const attempt: SocketAttempt = { id: newTelemetryId(), generation, opened: false, hadError: false };
+    this.attempt = attempt;
     let socket: WebSocket;
     try {
       socket = realtimeEvents(this.machineId);
     } catch {
-      this.scheduleReconnect(generation);
+      this.scheduleReconnect(generation, attempt, "scheduled");
       return;
     }
     this.socket = socket;
     socket.onopen = () => {
       if (!this.isCurrentSocket(socket, generation)) return;
+      attempt.opened = true;
+      recordAttemptTelemetry("realtime", attempt, { outcome: "open" });
       this.reconnectDelay = 500;
       this.onOpen?.();
     };
@@ -183,20 +212,29 @@ export class RealtimeSocket {
       if (this.isCurrentSocket(socket, generation)) void this.handleMessage(message.data, socket, generation);
     };
     socket.onerror = () => {
-      if (this.isCurrentSocket(socket, generation)) socket.close();
+      if (this.isCurrentSocket(socket, generation)) {
+        attempt.hadError = true;
+        socket.close();
+      }
     };
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (!this.isCurrentSocket(socket, generation)) return;
       this.socket = undefined;
-      this.scheduleReconnect(generation);
+      const outcomeAttempt = attempt.opened ? { ...attempt, id: newTelemetryId(), opened: false } : attempt;
+      this.scheduleReconnect(generation, outcomeAttempt, attempt.hadError ? "error" : "close", closeCode(event));
     };
   }
 
-  private scheduleReconnect(generation: number): void {
+  private scheduleReconnect(generation: number, attempt: SocketAttempt, outcome: "close" | "error" | "scheduled", closeCodeValue?: number): void {
     if (!this.shouldReconnect || generation !== this.generation) return;
     window.clearTimeout(this.reconnectTimer);
     const delay = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 1.6, 5000);
+    recordAttemptTelemetry("realtime", attempt, {
+      outcome,
+      ...(closeCodeValue === undefined ? {} : { closeCode: closeCodeValue }),
+      delayMs: delay,
+    });
     this.reconnectTimer = window.setTimeout(() => {
       if (!this.shouldReconnect || generation !== this.generation) return;
       this.reconnectTimer = undefined;
@@ -212,6 +250,31 @@ export class RealtimeSocket {
   private isCurrentSocket(socket: WebSocket, generation: number): boolean {
     return this.shouldReconnect && generation === this.generation && this.socket === socket;
   }
+
+  private reportReplacement(): void {
+    if (this.attempt === undefined || this.socket === undefined) return;
+    recordAttemptTelemetry("realtime", { ...this.attempt, id: newTelemetryId() }, { outcome: "replaced" });
+  }
+}
+
+interface SocketAttempt {
+  id: string | undefined;
+  generation: number;
+  opened: boolean;
+  hadError: boolean;
+}
+
+function recordAttemptTelemetry(
+  kind: "realtime" | "session",
+  attempt: SocketAttempt,
+  outcome: { outcome: "close" | "error" | "open" | "replaced" | "scheduled"; closeCode?: number; delayMs?: number },
+): void {
+  if (attempt.id === undefined) return;
+  recordSocketTelemetry({ kind, attemptId: attempt.id, generation: attempt.generation, ...outcome });
+}
+
+function closeCode(event: Event | undefined): number | undefined {
+  return event !== undefined && "code" in event && typeof event.code === "number" ? event.code : undefined;
 }
 
 export function parseSessionSocketEvent(event: unknown): SessionUiEvent | undefined {

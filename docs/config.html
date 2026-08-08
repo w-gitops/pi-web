@@ -97,6 +97,7 @@
             <a href="#project-config">Project config</a>
             <a href="#worktree-pre-remove-hook">Pre-remove hook</a>
             <a href="#keys">Config matrix</a>
+            <a href="#opentelemetry">OpenTelemetry</a>
             <a href="#path-access">External path access</a>
             <a href="#manual-uploads">Manual uploads</a>
             <a href="#agent-runtime">Agent profile and companion CLI</a>
@@ -569,15 +570,85 @@ worktree_path="$1"
                         <a href="#catalog-refresh">background model catalog refresh</a>
                       </td>
                     </tr>
+                    <tr>
+                      <td>OpenTelemetry export</td>
+                      <td>—</td>
+                      <td><code>OTEL_ENABLED</code></td>
+                      <td>Web/API + session daemon env</td>
+                      <td>Strict opt-in: only <code>1</code> or <code>true</code> enables it</td>
+                      <td>Restart both processes; configure each process environment</td>
+                    </tr>
+                    <tr>
+                      <td>OTLP/HTTP collector</td>
+                      <td>—</td>
+                      <td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code>, signal-specific endpoint/header variables, <code>OTEL_EXPORTER_OTLP_PROTOCOL</code></td>
+                      <td>Web/API + session daemon env</td>
+                      <td>Use <code>http/protobuf</code>; standard signal-specific variables take precedence</td>
+                      <td>Restart both processes</td>
+                    </tr>
+                    <tr>
+                      <td>Telemetry resource and batching</td>
+                      <td>—</td>
+                      <td><code>OTEL_SERVICE_NAME</code>, <code>OTEL_RESOURCE_ATTRIBUTES</code>, <code>OTEL_BSP_*</code>, <code>OTEL_BLRP_*</code>, <code>OTEL_EXPORTER_OTLP_TIMEOUT</code>, <code>OTEL_SHUTDOWN_TIMEOUT</code></td>
+                      <td>Web/API + session daemon env</td>
+                      <td>Defaults are bounded; service names default to <code>pi-web-server</code> and <code>pi-web-sessiond</code></td>
+                      <td>Restart the affected process</td>
+                    </tr>
                   </tbody>
                 </table>
               </div>
               <p>
                 Agent shells, terminals, and spawned sessions do not inherit the session daemon's own configuration:
-                at startup the daemon removes its <code>PI_WEB_*</code> configuration keys, <code>NODE_ENV</code>, <code>PORT</code>,
+                at startup the daemon removes its <code>PI_WEB_*</code> configuration keys, every <code>OTEL_*</code> key, <code>NODE_ENV</code>, <code>PORT</code>,
                 and <code>PI_CODING_AGENT_SESSION_DIR</code> from the environment agent processes see, so commands like
                 <code>npm install</code> behave normally inside sessions. <code>PI_CODING_AGENT_DIR</code> and ordinary
-                variables stay visible; the daemon keeps using the values it captured at startup.
+                variables stay visible; the daemon keeps using the values it captured at startup, including telemetry
+                configuration, without exposing collector headers or service identity to agent children.
+              </p>
+            </section>
+
+            <section id="opentelemetry">
+              <h2>OpenTelemetry observability</h2>
+              <p>
+                OpenTelemetry is off unless <code>OTEL_ENABLED</code> is exactly <code>1</code> or <code>true</code>.
+                Enable it in both the web/API and session-daemon process environments to preserve traces across the
+                web-to-daemon hop. A minimal OTLP/HTTP configuration is:
+              </p>
+              <div class="code-card">
+                <pre><code>OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example:4318
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod,service.namespace=ssiops</code></pre>
+              </div>
+              <p>
+                The default service names are <code>pi-web-server</code> and <code>pi-web-sessiond</code>.
+                <code>OTEL_SERVICE_NAME</code> overrides the default for that process. Standard trace/log endpoint and
+                header variables are supported. Keep exporter headers and custom resource-attribute values non-sensitive:
+                headers configure transport, while resource attributes are attached to exported records.
+              </p>
+              <p>
+                PI WEB exports auto-instrumented traces and a separate, explicit allowlisted log stream. Existing
+                Pino/Fastify application logs stay in the normal local logging destination and are never copied into OTLP.
+                Before trace export, PI WEB replaces dynamic span names with closed operation names, allowlists safe
+                HTTP/client attributes, and drops span events, links, status messages, URLs, paths, error text, and
+                application identifiers. Browser diagnostics contain only closed operation/outcome enums, bounded
+                numbers/booleans, and random per-attempt IDs—never prompts, response bodies, error messages, URLs,
+                socket reasons, machine/session/workspace identifiers, or filesystem paths.
+              </p>
+              <p>
+                Browser diagnostics use the local <code>/api/client-telemetry</code> route only when the web/API process
+                has telemetry enabled. Delivery has its own bounded transport and may retry telemetry after an outage;
+                PI WEB never retries the failed application request, including prompt delivery. Intake is not
+                machine-proxied and is excluded from HTTP auto-instrumentation.
+              </p>
+              <p>
+                For troubleshooting, query traces by <code>service.name = pi-web-server</code> or
+                <code>service.name = pi-web-sessiond</code>; web and daemon spans for a request should share a trace ID.
+                Query explicit logs by event name/body <code>service.started</code>, <code>service.stopping</code>,
+                <code>service.stopped</code>, <code>http.server.error</code>, <code>client.api</code>,
+                <code>client.socket</code>, or <code>client.browser</code>. Collector failures do not stop PI WEB:
+                startup and shutdown are fail-open and bounded. Check local process logs for the fixed OpenTelemetry
+                startup warning, then verify the endpoint, protocol, and headers if no telemetry arrives.
               </p>
             </section>
 

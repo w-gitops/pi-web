@@ -60,6 +60,24 @@ describe("agent process environment visibility", () => {
     expect(isAgentVisibleEnvKey("PI_CODING_AGENT_SESSION_DIR")).toBe(false);
   });
 
+  it("hides every current and future OTEL_* setting from agent children", () => {
+    const telemetryKeys = [
+      "OTEL_ENABLED",
+      "OTEL_SERVICE_NAME",
+      "OTEL_RESOURCE_ATTRIBUTES",
+      "OTEL_EXPORTER_OTLP_ENDPOINT",
+      "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+      "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+      "OTEL_EXPORTER_OTLP_HEADERS",
+      "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+      "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+      "OTEL_PROPAGATORS",
+      "OTEL_BSP_MAX_QUEUE_SIZE",
+      "OTEL_FUTURE_SENSITIVE_SETTING",
+    ];
+    for (const key of telemetryKeys) expect(isAgentVisibleEnvKey(key)).toBe(false);
+  });
+
   it("removes hidden keys from the environment and reports them sorted", () => {
     const env: NodeJS.ProcessEnv = {
       PATH: "/usr/bin",
@@ -70,11 +88,13 @@ describe("agent process environment visibility", () => {
       PI_WEB_SESSIOND_SOCKET: "/data/pi-web/sessiond.sock",
       PI_WEB_DOCKER_MODE: "runtime",
       HOSTEXEC_MODE: "nsenter",
+      OTEL_ENABLED: "true",
+      OTEL_EXPORTER_OTLP_HEADERS: "authorization=private",
     };
 
     const scrubbed = scrubNonAgentVisibleEnvKeys(env);
 
-    expect(scrubbed).toEqual(["NODE_ENV", "PI_WEB_DATA_DIR", "PI_WEB_SESSIOND_SOCKET", "PORT"]);
+    expect(scrubbed).toEqual(["NODE_ENV", "OTEL_ENABLED", "OTEL_EXPORTER_OTLP_HEADERS", "PI_WEB_DATA_DIR", "PI_WEB_SESSIOND_SOCKET", "PORT"]);
     expect(env).toEqual({
       PATH: "/usr/bin",
       HOME: "/data/home",

@@ -177,6 +177,9 @@ Rows with JSON key `—` are runtime-only environment variables, not config-file
 | Agent profile state directory | — | `PI_WEB_AGENT_DIR` (`PI_CODING_AGENT_DIR` for Pi compatibility) | Web/API + session daemon env | Not supported locally | Restart services |
 | Skip update checks | — | `PI_WEB_SKIP_VERSION_CHECK`, `PI_WEB_OFFLINE`, `PI_SKIP_VERSION_CHECK`, `PI_OFFLINE` | Web/API env | Not supported locally | Restart web/API after env changes |
 | Offline mode | — | `PI_WEB_OFFLINE`, `PI_OFFLINE` | Web/API + session daemon env | Not supported locally | Restart session daemon and web/API after env changes; also disables the [background model catalog refresh](#background-model-catalog-refresh) |
+| OpenTelemetry export | — | `OTEL_ENABLED` | Web/API + session daemon env | Strict opt-in: only `1` or `true` enables it | Restart both processes; configure each process environment |
+| OTLP/HTTP collector | — | `OTEL_EXPORTER_OTLP_ENDPOINT`, signal-specific endpoint/header variables, `OTEL_EXPORTER_OTLP_PROTOCOL` | Web/API + session daemon env | Use `http/protobuf`; standard signal-specific variables take precedence | Restart both processes |
+| Telemetry resource and batching | — | `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_BSP_*`, `OTEL_BLRP_*`, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_SHUTDOWN_TIMEOUT` | Web/API + session daemon env | Defaults are bounded; service names default to `pi-web-server` and `pi-web-sessiond` | Restart the affected process |
 
 ## Key details
 
@@ -190,7 +193,26 @@ This setting does not change the PI WEB config file selected by `PI_WEB_CONFIG` 
 
 ### Agent process environment
 
-Agent shells, terminals, and spawned sessions do not inherit the session daemon's own configuration. When the daemon starts, it removes its `PI_WEB_*` configuration keys, `NODE_ENV`, `PORT`, and `PI_CODING_AGENT_SESSION_DIR` from the environment agent processes see, so development commands behave normally inside sessions — for example, `npm install` is not affected by a production `NODE_ENV` meant for the daemon, and a second PI WEB instance started from a session does not pick up the live daemon's data directory or socket. `PI_CODING_AGENT_DIR` and ordinary variables (`PATH`, `HOME`, proxy settings, and the like) remain visible. The daemon itself keeps using the values it captured at startup.
+Agent shells, terminals, and spawned sessions do not inherit the session daemon's own configuration. When the daemon starts, it removes its `PI_WEB_*` configuration keys, every `OTEL_*` key, `NODE_ENV`, `PORT`, and `PI_CODING_AGENT_SESSION_DIR` from the environment agent processes see, so development commands behave normally inside sessions — for example, `npm install` is not affected by a production `NODE_ENV` meant for the daemon, and a second PI WEB instance started from a session does not pick up the live daemon's data directory, socket, collector headers, or telemetry service identity. `PI_CODING_AGENT_DIR` and ordinary variables (`PATH`, `HOME`, proxy settings, and the like) remain visible. The daemon itself keeps using the values it captured at startup.
+
+### OpenTelemetry observability
+
+OpenTelemetry is off unless `OTEL_ENABLED` is exactly `1` or `true`. Enable it in both the web/API and session-daemon process environments to preserve traces across the web-to-daemon hop. A minimal OTLP/HTTP configuration is:
+
+```sh
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example:4318
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod,service.namespace=ssiops
+```
+
+The default service names are `pi-web-server` and `pi-web-sessiond`. `OTEL_SERVICE_NAME` overrides the default for the process where it is set. Standard trace/log endpoint and header variables are supported. Keep exporter headers and custom `OTEL_RESOURCE_ATTRIBUTES` values non-sensitive: headers configure transport, while resource attributes are attached to exported records.
+
+PI WEB exports auto-instrumented traces and a separate, explicit allowlisted log stream. Existing Pino/Fastify application logs stay in the normal local logging destination and are never copied into OTLP. Before trace export, PI WEB replaces dynamic span names with closed operation names, allowlists safe HTTP/client attributes, and drops span events, links, status messages, URLs, paths, error text, and application identifiers. Browser diagnostics likewise contain only closed operation/outcome enums, bounded numbers/booleans, and random per-attempt IDs; they never contain prompts, response bodies, error messages, URLs, socket reasons, machine/session/workspace identifiers, or filesystem paths.
+
+Browser diagnostics use the local `/api/client-telemetry` route only when the web/API process has telemetry enabled. Delivery has its own bounded transport and may retry telemetry after an outage; PI WEB never retries the failed application request, including prompt delivery. Intake is not machine-proxied and is excluded from HTTP auto-instrumentation.
+
+For troubleshooting, query traces by `service.name = pi-web-server` or `service.name = pi-web-sessiond`; the web and daemon spans for a request should share a trace ID. Query the explicit log stream by event name/body `service.started`, `service.stopping`, `service.stopped`, `http.server.error`, `client.api`, `client.socket`, or `client.browser`. Repeated collector failures do not stop PI WEB: startup and shutdown are fail-open and bounded. Check the process's local logs for the fixed OpenTelemetry startup warning and verify the collector endpoint, protocol, and headers if no telemetry arrives.
 
 ### External path access
 

@@ -1,9 +1,13 @@
 import http from "node:http";
 import { WebSocket } from "ws";
+import { context, isSpanContextValid, trace, type Context } from "@opentelemetry/api";
 import { isHostAbsoluteAgentDir, isSafeAgentCommandForHost } from "../config.js";
 import type { ActiveAgentProfileDescriptor } from "../shared/apiTypes.js";
 import { parsePiWebRuntimeComponent } from "../shared/piWebStatusParsing.js";
 import { sessiondHttpUrl, sessiondSocketPath } from "./config.js";
+
+const CANONICAL_TRACE_ID = /^(?!0{32}$)[0-9a-f]{32}$/;
+const CANONICAL_SPAN_ID = /^(?!0{16}$)[0-9a-f]{16}$/;
 
 export type SessionDaemonAgentProfileResult =
   | { status: "available"; profile: ActiveAgentProfileDescriptor }
@@ -14,9 +18,22 @@ export interface SessionDaemonRequestClient {
   request(method: string, path: string, body?: unknown): Promise<{ statusCode: number; headers: Record<string, string>; body: string }>;
 }
 
+export interface SessionDaemonClientOptions {
+  baseUrl?: string;
+  socketPath?: string;
+  activeContext?: () => Context;
+}
+
 export class SessionDaemonClient {
-  private readonly baseUrl = sessiondHttpUrl();
-  private readonly socketPath = sessiondSocketPath();
+  private readonly baseUrl: string | undefined;
+  private readonly socketPath: string;
+  private readonly activeContext: () => Context;
+
+  constructor(options: SessionDaemonClientOptions = {}) {
+    this.baseUrl = options.baseUrl ?? sessiondHttpUrl();
+    this.socketPath = options.socketPath ?? sessiondSocketPath();
+    this.activeContext = options.activeContext ?? (() => context.active());
+  }
 
   async request(method: string, path: string, body?: unknown): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> {
     const payload = body === undefined ? undefined : JSON.stringify(body);
@@ -38,9 +55,10 @@ export class SessionDaemonClient {
   }
 
   private async requestUrl(method: string, path: string, payload?: string) {
-    const init: RequestInit = { method };
+    const headers = new Headers(activeW3cTraceHeaders(this.activeContext()));
+    const init: RequestInit = { method, headers };
     if (payload !== undefined && payload !== "") {
-      init.headers = { "content-type": "application/json" };
+      headers.set("content-type", "application/json");
       init.body = payload;
     }
     const response = await fetch(new URL(path, this.baseUrl), init);
@@ -52,15 +70,18 @@ export class SessionDaemonClient {
   }
 
   private requestSocket(method: string, path: string, payload?: string): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> {
+    const headers: Record<string, string | number> = activeW3cTraceHeaders(this.activeContext());
+    if (payload !== undefined && payload !== "") {
+      headers["content-type"] = "application/json";
+      headers["content-length"] = Buffer.byteLength(payload);
+    }
     return new Promise((resolve, reject) => {
       const request = http.request(
         {
           socketPath: this.socketPath,
           path,
           method,
-          headers: payload !== undefined && payload !== ""
-            ? { "content-type": "application/json", "content-length": Buffer.byteLength(payload) }
-            : undefined,
+          headers,
         },
         (response) => {
           const chunks: Uint8Array[] = [];
@@ -81,6 +102,16 @@ export class SessionDaemonClient {
       request.end();
     });
   }
+}
+
+export function activeW3cTraceHeaders(activeContext: Context = context.active()): Record<string, string> {
+  const spanContext = trace.getSpanContext(activeContext);
+  if (spanContext === undefined || !isSpanContextValid(spanContext)) return {};
+  if (!CANONICAL_TRACE_ID.test(spanContext.traceId) || !CANONICAL_SPAN_ID.test(spanContext.spanId)) return {};
+  const flags = (spanContext.traceFlags & 0x01).toString(16).padStart(2, "0");
+  // Never forward inbound tracestate. Vendor values are untrusted opaque text,
+  // while the canonical traceparent alone is sufficient for correlation.
+  return { traceparent: `00-${spanContext.traceId}-${spanContext.spanId}-${flags}` };
 }
 
 export async function getSessionDaemonActiveAgentProfile(client: SessionDaemonRequestClient): Promise<SessionDaemonAgentProfileResult> {

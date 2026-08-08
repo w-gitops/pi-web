@@ -23,6 +23,9 @@
  *   added in the future — except `PI_WEB_DOCKER_*` deployment descriptors,
  *   which the agent-facing `pi-web-docker` CLI reads.
  * - `HOSTEXEC_*` stays: agents use `hostexec`.
+ * - Every `OTEL_*` key is removed after the daemon's telemetry bootstrap has
+ *   captured and applied it. This prevents agent children from exporting
+ *   unrelated work with the daemon's collector, headers, or service identity.
  * - `PI_CODING_AGENT_DIR` stays so agent-spawned `pi` CLIs find the profile's
  *   auth and models; `PI_CODING_AGENT_SESSION_DIR` is daemon session-discovery
  *   wiring and is removed.
@@ -45,6 +48,7 @@ const DAEMON_ONLY_ENV_KEYS = new Set(["NODE_ENV", "PORT", "PI_CODING_AGENT_SESSI
 
 export function isAgentVisibleEnvKey(key: string): boolean {
   if (key.startsWith("PI_WEB_")) return AGENT_VISIBLE_PI_WEB_PREFIXES.some((prefix) => key.startsWith(prefix));
+  if (key.startsWith("OTEL_")) return false;
   return !DAEMON_ONLY_ENV_KEYS.has(key);
 }
 
