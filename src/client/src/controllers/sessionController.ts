@@ -27,6 +27,7 @@ export interface SessionEventSocket {
     onInitialOpen?: () => void,
   ): void;
   setHandler(onEvent: (event: SessionUiEvent) => void): void;
+  reconnect(): void;
   close(): void;
 }
 
@@ -393,7 +394,12 @@ export class SessionController {
       this.markCachedNewSessionPersisted(session);
       return true;
     } catch (error) {
-      this.setState({ error: String(error) });
+      if (error instanceof TypeError) {
+        if (this.isSelectedSessionIdentity(session.id, machineId)) this.reconnectActiveSession();
+        this.setState({ error: `Prompt delivery may be unknown because the connection failed. ${String(error)}` });
+      } else {
+        this.setState({ error: String(error) });
+      }
       return false;
     } finally {
       if (options.markSending) this.markSendingPrompt(session.id, false);
@@ -1006,6 +1012,12 @@ export class SessionController {
     } catch (error) {
       this.setState({ error: String(error) });
     }
+  }
+
+  reconnectActiveSession(): void {
+    const session = this.getState().selectedSession;
+    if (this.disposed || session === undefined || session.archived === true || isClientPendingStartSessionInfo(session)) return;
+    this.socket.reconnect();
   }
 
   refreshSelectedSession(sessionId = this.getState().selectedSession?.id): Promise<void> {
@@ -1820,4 +1832,3 @@ function isHighFrequencyTranscriptEvent(event: SessionUiEvent): boolean {
 function isSessionNotFoundError(error: unknown): boolean {
   return error instanceof Error && error.message.toLowerCase().includes("session not found");
 }
-

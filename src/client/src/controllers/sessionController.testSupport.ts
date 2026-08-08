@@ -38,6 +38,7 @@ export class MemoryStorage implements Storage {
 
 export class FakeSocket implements SessionEventSocket {
   readonly connectedSessionIds: string[] = [];
+  reconnectCalls = 0;
 
   connect(session: SessionRef): void {
     this.connectedSessionIds.push(session.id);
@@ -47,6 +48,10 @@ export class FakeSocket implements SessionEventSocket {
     // Test socket does not emit events.
   }
 
+  reconnect(): void {
+    this.reconnectCalls += 1;
+  }
+
   close(): void {
     // No-op.
   }
@@ -54,6 +59,7 @@ export class FakeSocket implements SessionEventSocket {
 
 export class EmitSocket implements SessionEventSocket {
   readonly connectedSessionIds: string[] = [];
+  reconnectCalls = 0;
   private handler: ((event: SessionUiEvent) => void) | undefined;
   private onInitialOpen: (() => void) | undefined;
 
@@ -79,6 +85,10 @@ export class EmitSocket implements SessionEventSocket {
 
   open(): void {
     this.onInitialOpen?.();
+  }
+
+  reconnect(): void {
+    this.reconnectCalls += 1;
   }
 
   close(): void {

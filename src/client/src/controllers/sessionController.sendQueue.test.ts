@@ -1,9 +1,43 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { initialAppState } from "../appState";
 import { SessionController } from "./sessionController";
 import { defaultApi, deferred, emptyPage, FakeSocket, oldSession, replacementSession, sessionLookupId, status, workspace, type AppState, type Deferred, type PromptAttachment, type SessionInfo } from "./sessionController.testSupport";
 
 describe("SessionController send queue", () => {
+  it("reconnects the selected session without retrying an ambiguously failed prompt", async () => {
+    let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession] };
+    const prompt = vi.fn(() => Promise.reject(new TypeError("Load failed")));
+    const socket = new FakeSocket();
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      undefined,
+      { api: { ...defaultApi, prompt }, socket },
+    );
+
+    await controller.send("do this once");
+
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(socket.reconnectCalls).toBe(1);
+    expect(state.error).toBe("Prompt delivery may be unknown because the connection failed. TypeError: Load failed");
+  });
+
+  it("does not clear an existing global warning after a successful prompt", async () => {
+    let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession], error: "Keep this warning" };
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      undefined,
+      { api: { ...defaultApi, prompt: () => Promise.resolve({ accepted: true }) }, socket: new FakeSocket() },
+    );
+
+    await controller.send("hello");
+
+    expect(state.error).toBe("Keep this warning");
+  });
+
   it("toggles the per-session sending state around an inline attachment send and forwards attachments", async () => {
     let resolvePrompt: (() => void) | undefined;
     let promptArgs: { attachments?: PromptAttachment[] } | undefined;

@@ -10,13 +10,14 @@ export class SessionSocket {
   private socket: WebSocket | undefined;
   private session: SessionRef | undefined;
   private onEvent: ((event: SessionUiEvent) => void) | undefined;
-  private reconnectTimer?: number;
+  private reconnectTimer: number | undefined;
   private reconnectDelay = 500;
   private shouldReconnect = false;
   private hasOpened = false;
   private onReconnect: (() => void) | undefined;
   private onInitialOpen: (() => void) | undefined;
   private machineId = "local";
+  private generation = 0;
 
   connect(
     session: SessionRef,
@@ -39,9 +40,22 @@ export class SessionSocket {
     this.onEvent = onEvent;
   }
 
+  reconnect(): void {
+    if (!this.shouldReconnect) return;
+    const generation = ++this.generation;
+    window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    closeSocketQuietly(this.socket);
+    this.socket = undefined;
+    this.reconnectDelay = 500;
+    this.open(generation);
+  }
+
   close(): void {
+    this.generation += 1;
     this.shouldReconnect = false;
     window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
     closeSocketQuietly(this.socket);
     this.socket = undefined;
     this.session = undefined;
@@ -52,41 +66,59 @@ export class SessionSocket {
     this.machineId = "local";
   }
 
-  private open(): void {
+  private open(generation = this.generation): void {
     const session = this.session;
-    if (session === undefined || session.id === "" || session.cwd === "" || !this.shouldReconnect) return;
-    const socket = sessionEvents(session, this.machineId);
+    if (generation !== this.generation || session === undefined || session.id === "" || session.cwd === "" || !this.shouldReconnect) return;
+    let socket: WebSocket;
+    try {
+      socket = sessionEvents(session, this.machineId);
+    } catch {
+      this.scheduleReconnect(generation);
+      return;
+    }
     this.socket = socket;
     socket.onopen = () => {
-      if (this.socket !== socket) return;
+      if (!this.isCurrentSocket(socket, generation)) return;
       this.reconnectDelay = 500;
       const isReconnect = this.hasOpened;
       this.hasOpened = true;
       if (isReconnect) this.onReconnect?.();
       else this.onInitialOpen?.();
     };
-    socket.onmessage = (message) => void this.handleMessage(message.data, socket, session);
-    socket.onerror = () => { socket.close(); };
+    socket.onmessage = (message) => {
+      if (this.isCurrentSocket(socket, generation)) void this.handleMessage(message.data, socket, session, generation);
+    };
+    socket.onerror = () => {
+      if (this.isCurrentSocket(socket, generation)) socket.close();
+    };
     socket.onclose = () => {
-      if (this.socket !== socket) return;
+      if (!this.isCurrentSocket(socket, generation)) return;
       this.socket = undefined;
-      this.scheduleReconnect();
+      this.scheduleReconnect(generation);
     };
   }
 
-  private scheduleReconnect(): void {
-    if (!this.shouldReconnect) return;
+  private scheduleReconnect(generation: number): void {
+    if (!this.shouldReconnect || generation !== this.generation) return;
     window.clearTimeout(this.reconnectTimer);
     const delay = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 1.6, 5000);
-    this.reconnectTimer = window.setTimeout(() => { this.open(); }, delay);
+    this.reconnectTimer = window.setTimeout(() => {
+      if (!this.shouldReconnect || generation !== this.generation) return;
+      this.reconnectTimer = undefined;
+      this.open(generation);
+    }, delay);
   }
 
-  private async handleMessage(data: MessageEvent["data"], socket: WebSocket, session: SessionRef): Promise<void> {
+  private async handleMessage(data: MessageEvent["data"], socket: WebSocket, session: SessionRef, generation: number): Promise<void> {
     const event = parseSessionSocketEvent(await parseSocketEvent(data));
-    if (this.socket !== socket || event === undefined) return;
+    if (!this.isCurrentSocket(socket, generation) || event === undefined) return;
     if (event.type === "notifications.inbox" && (session.id !== event.summary.sessionId || session.cwd !== event.summary.cwd)) return;
     this.onEvent?.(event);
+  }
+
+  private isCurrentSocket(socket: WebSocket, generation: number): boolean {
+    return this.shouldReconnect && generation === this.generation && this.socket === socket;
   }
 }
 
@@ -94,10 +126,11 @@ export class RealtimeSocket {
   private socket: WebSocket | undefined;
   private onEvent: ((event: BrowserRealtimeEvent) => void) | undefined;
   private onOpen: (() => void) | undefined;
-  private reconnectTimer?: number;
+  private reconnectTimer: number | undefined;
   private reconnectDelay = 500;
   private shouldReconnect = false;
   private machineId = "local";
+  private generation = 0;
 
   connect(onEvent: (event: BrowserRealtimeEvent) => void, onOpen?: () => void, machineId = "local"): void {
     this.close();
@@ -108,9 +141,22 @@ export class RealtimeSocket {
     this.open();
   }
 
+  reconnect(): void {
+    if (!this.shouldReconnect) return;
+    const generation = ++this.generation;
+    window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    closeSocketQuietly(this.socket);
+    this.socket = undefined;
+    this.reconnectDelay = 500;
+    this.open(generation);
+  }
+
   close(): void {
+    this.generation += 1;
     this.shouldReconnect = false;
     window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
     closeSocketQuietly(this.socket);
     this.socket = undefined;
     this.onEvent = undefined;
@@ -118,35 +164,53 @@ export class RealtimeSocket {
     this.machineId = "local";
   }
 
-  private open(): void {
-    if (!this.shouldReconnect) return;
-    const socket = realtimeEvents(this.machineId);
+  private open(generation = this.generation): void {
+    if (!this.shouldReconnect || generation !== this.generation) return;
+    let socket: WebSocket;
+    try {
+      socket = realtimeEvents(this.machineId);
+    } catch {
+      this.scheduleReconnect(generation);
+      return;
+    }
     this.socket = socket;
     socket.onopen = () => {
-      if (this.socket !== socket) return;
+      if (!this.isCurrentSocket(socket, generation)) return;
       this.reconnectDelay = 500;
       this.onOpen?.();
     };
-    socket.onmessage = (message) => void this.handleMessage(message.data, socket);
-    socket.onerror = () => { socket.close(); };
+    socket.onmessage = (message) => {
+      if (this.isCurrentSocket(socket, generation)) void this.handleMessage(message.data, socket, generation);
+    };
+    socket.onerror = () => {
+      if (this.isCurrentSocket(socket, generation)) socket.close();
+    };
     socket.onclose = () => {
-      if (this.socket !== socket) return;
+      if (!this.isCurrentSocket(socket, generation)) return;
       this.socket = undefined;
-      this.scheduleReconnect();
+      this.scheduleReconnect(generation);
     };
   }
 
-  private scheduleReconnect(): void {
-    if (!this.shouldReconnect) return;
+  private scheduleReconnect(generation: number): void {
+    if (!this.shouldReconnect || generation !== this.generation) return;
     window.clearTimeout(this.reconnectTimer);
     const delay = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 1.6, 5000);
-    this.reconnectTimer = window.setTimeout(() => { this.open(); }, delay);
+    this.reconnectTimer = window.setTimeout(() => {
+      if (!this.shouldReconnect || generation !== this.generation) return;
+      this.reconnectTimer = undefined;
+      this.open(generation);
+    }, delay);
   }
 
-  private async handleMessage(data: MessageEvent["data"], socket: WebSocket): Promise<void> {
+  private async handleMessage(data: MessageEvent["data"], socket: WebSocket, generation: number): Promise<void> {
     const event = parseRealtimeSocketEvent(await parseSocketEvent(data));
-    if (this.socket === socket && event !== undefined) this.onEvent?.(event);
+    if (this.isCurrentSocket(socket, generation) && event !== undefined) this.onEvent?.(event);
+  }
+
+  private isCurrentSocket(socket: WebSocket, generation: number): boolean {
+    return this.shouldReconnect && generation === this.generation && this.socket === socket;
   }
 }
 
@@ -210,12 +274,26 @@ async function parseSocketEvent(data: MessageEvent["data"]): Promise<unknown> {
 
 function closeSocketQuietly(socket: WebSocket | undefined): void {
   if (socket === undefined) return;
+  socket.onopen = null;
   socket.onmessage = null;
   socket.onerror = null;
   socket.onclose = null;
   if (socket.readyState === WebSocket.CONNECTING) {
-    socket.onopen = () => { socket.close(); };
+    // Some browsers reject close() while connecting. Keep only an inert cleanup
+    // callback so a replaced socket cannot survive after its handshake finishes.
+    socket.onopen = () => {
+      socket.onopen = null;
+      tryCloseSocket(socket);
+    };
     return;
   }
-  socket.close();
+  tryCloseSocket(socket);
+}
+
+function tryCloseSocket(socket: WebSocket): void {
+  try {
+    socket.close();
+  } catch {
+    // Replacement has already detached this socket, so close failures are inert.
+  }
 }

@@ -210,6 +210,7 @@ export class PiWebApp extends LitElement {
   private readonly appShell = new AppShellController(this);
   private readonly browserResume = new BrowserResumeController({
     onResumeSignal: () => { this.handleBrowserResumeSignal(); },
+    onNetworkOnline: () => { this.reconnectBrowserTransports(); },
     refreshAfterResume: () => this.refreshAfterBrowserResume(),
     onRefreshError: (error) => { console.warn("Failed to refresh after browser resume", error); },
   });
@@ -436,6 +437,12 @@ export class PiWebApp extends LitElement {
     this.appShell.repairViewportPosition();
     this.schedulePiWebStatusRefresh();
     this.retryPendingRemoteRouteRestoreSoon();
+  }
+
+  private reconnectBrowserTransports(): void {
+    this.realtime.reconnect();
+    for (const socket of this.machineRealtimeSockets.values()) socket.reconnect();
+    this.sessions.reconnectActiveSession();
   }
 
   private async refreshAfterBrowserResume(): Promise<void> {
