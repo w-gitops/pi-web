@@ -45,11 +45,17 @@ Copy `server/chatterbox-service.py` and `server/_telemetry.py` into one working 
 PORT=9004 \
 CHATTERBOX_DEVICE=cuda \
 VOICES_DIR=/opt/chatterbox-voices \
+CHATTERBOX_CFM_STEPS=7 \
+CHATTERBOX_FIRST_CHUNK_CHARS=160 \
+CHATTERBOX_SECOND_CHUNK_CHARS=80 \
+CHATTERBOX_LATER_CHUNK_CHARS=120 \
 OTEL_SERVICE_NAME=voice-tts-chatterbox \
 python server/chatterbox-service.py
 ```
 
-`server/chatterbox.service.example` shows a systemd unit. Chatterbox voice conditionals are mutable, so a process-local lock serializes warmup, legacy requests, and streamed chunks. Multiple workers sharing one model are unsupported.
+`server/chatterbox.service.example` shows a systemd unit. Chatterbox voice conditionals are mutable, so a process-local lock serializes warmup, legacy requests, and streamed chunks. Multiple workers sharing one model are unsupported. Cancelling a request stops future chunks but cannot interrupt a `model.generate()` call already executing; a replacement request may briefly wait for that active GPU chunk.
+
+The service defaults to Chatterbox's 10 CFM steps and uniform 160-character chunks. The example above is a measured Quadro P2200 startup profile: seven CFM steps, a 160-character playback-buffer chunk, an 80-character successor, then 120-character steady-state chunks. Treat these as deployment tuning rather than universal defaults, and verify voice quality and successor readiness on the target model and GPU.
 
 ## HTTPS reverse proxy
 
@@ -72,7 +78,7 @@ Keep the route behind the same authentication boundary as PI WEB.
 
 ## Streaming behavior
 
-The plugin posts one immutable cleaned message to `/v1/audio/speech/stream`. The server normalizes and splits it into 160-character sentence/whitespace chunks, synthesizes them serially, and yields base64 PCM16 WAV records over bounded NDJSON. The browser:
+The plugin posts one immutable cleaned message to `/v1/audio/speech/stream`. The server normalizes and splits it at configurable sentence/whitespace boundaries, synthesizes chunks serially, and yields base64 PCM16 WAV records over bounded NDJSON. The browser:
 
 - validates MIME type, protocol version, record ordering, WAV shape, and byte/count limits;
 - starts after the first record and decodes at most one successor ahead;
@@ -85,7 +91,7 @@ The first-record deadline is 75 seconds and each later stream read has a separat
 
 ## Observability
 
-Every browser request carries an opaque `X-Chatterbox-Request-Id`. The service includes it in structured logs and OpenTelemetry spans for stream acceptance, each chunk's start/readiness, completion, disconnect, and failure. Chunk telemetry includes synthesis time, audio duration, byte count, and real-time factor. Configure `OTEL_EXPORTER_OTLP_ENDPOINT` to send traces and logs to an OTLP-gRPC collector such as SigNoz; it defaults to `http://localhost:4317`.
+Every browser request carries an opaque `X-Chatterbox-Request-Id`. The service includes it in structured logs and OpenTelemetry spans for stream acceptance, each chunk's start/readiness, completion, disconnect, and failure. Chunk telemetry includes lock wait, conditional selection, T3 autoregressive generation, S3 flow, HiFT vocoding, encoding, synthesis time, audio duration, byte count, and real-time factor. Configure `OTEL_EXPORTER_OTLP_ENDPOINT` to send traces and logs to an OTLP-gRPC collector such as SigNoz; it defaults to `http://localhost:4317`.
 
 PI WEB's privacy-bounded client telemetry records overall browser success, timeout, abort, network, and parse outcomes using the same opaque request ID when client telemetry is enabled.
 

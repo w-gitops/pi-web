@@ -3,8 +3,10 @@ import ast
 import base64
 import json
 import math
+import os
 from pathlib import Path
 import re
+from typing import Any
 import unittest
 
 
@@ -12,7 +14,8 @@ SERVICE_PATH = Path(__file__).with_name("chatterbox-service.py")
 SOURCE = SERVICE_PATH.read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 CONSTANTS = {
-    "STREAM_PROTOCOL_VERSION", "FIRST_CHUNK_CHARS", "LATER_CHUNK_CHARS",
+    "STREAM_PROTOCOL_VERSION", "FIRST_CHUNK_CHARS", "SECOND_CHUNK_CHARS",
+    "LATER_CHUNK_CHARS",
     "MAX_REQUEST_BYTES", "MAX_INPUT_CHARS", "MAX_STREAM_CHUNKS",
     "MAX_VOICE_CHARS", "MAX_MODEL_CHARS", "STREAM_FIELDS", "_SENTENCE_END",
 }
@@ -32,12 +35,12 @@ def load_pure_helpers():
                 body.append(node)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in FUNCTIONS:
             body.append(node)
-    namespace = {"re": re, "json": json, "base64": base64, "math": math}
+    namespace = {"re": re, "json": json, "base64": base64, "math": math, "os": os}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(SERVICE_PATH), "exec"), namespace)
     return namespace
 
 
-H = load_pure_helpers()
+H: Any = load_pure_helpers()
 
 
 class StreamHelperTests(unittest.TestCase):
@@ -56,6 +59,19 @@ class StreamHelperTests(unittest.TestCase):
         after_heading = split(opening + " Heading. " + ("word " * 100))
         self.assertTrue(after_heading[1].startswith("Heading."))
         self.assertGreaterEqual(len(after_heading[1]), 80)
+
+    def test_configured_second_chunk_creates_startup_buffer(self):
+        split = H["split_speech_text"]
+        names = ("FIRST_CHUNK_CHARS", "SECOND_CHUNK_CHARS", "LATER_CHUNK_CHARS")
+        previous = tuple(H[name] for name in names)
+        try:
+            H.update(dict(zip(names, (120, 80, 120), strict=True)))
+            self.assertEqual(
+                [len(chunk) for chunk in split("x" * 490)],
+                [120, 80, 120, 120, 50],
+            )
+        finally:
+            H.update(dict(zip(names, previous, strict=True)))
 
     def test_later_chunks_prefer_last_complete_sentence(self):
         split = H["split_speech_text"]

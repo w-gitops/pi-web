@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
 """OpenAI-compatible Chatterbox TTS service with sentence/WAV streaming."""
 import base64
 import io
@@ -30,13 +31,22 @@ PORT = int(os.getenv("PORT", "9004"))
 VOICES_DIR = os.getenv("VOICES_DIR", "/opt/chatterbox-voices")
 
 STREAM_PROTOCOL_VERSION = "1"
-FIRST_CHUNK_CHARS = 160
-LATER_CHUNK_CHARS = 160
+FIRST_CHUNK_CHARS = int(os.getenv("CHATTERBOX_FIRST_CHUNK_CHARS", "160"))
+SECOND_CHUNK_CHARS = int(os.getenv("CHATTERBOX_SECOND_CHUNK_CHARS", "160"))
+LATER_CHUNK_CHARS = int(os.getenv("CHATTERBOX_LATER_CHUNK_CHARS", "160"))
+if not all(
+    32 <= size <= 1000
+    for size in (FIRST_CHUNK_CHARS, SECOND_CHUNK_CHARS, LATER_CHUNK_CHARS)
+):
+    raise ValueError("CHATTERBOX chunk sizes must be between 32 and 1000 characters")
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_INPUT_CHARS = 20_000
 MAX_STREAM_CHUNKS = 128
 MAX_VOICE_CHARS = 128
 MAX_MODEL_CHARS = 128
+CFM_STEPS = int(os.getenv("CHATTERBOX_CFM_STEPS", "10"))
+if not 1 <= CFM_STEPS <= 50:
+    raise ValueError("CHATTERBOX_CFM_STEPS must be between 1 and 50")
 STREAM_FIELDS = frozenset({"model", "input", "voice", "response_format", "speed"})
 _SENTENCE_END = re.compile(r"[.!?\u3002\uff01\uff1f]+[\"'\u201d\u2019)]*(?=\s|$)")
 
@@ -63,7 +73,53 @@ with tracer.start_as_current_span("voice.tts.model_load") as span:
 # serializes all access to mutable model conditionals within that process.
 _synthesis_lock = threading.Lock()
 _DEFAULT_CONDS = model.conds
-_active_voice = {"key": None}
+_active_voice: dict[str, object] = {"key": None}
+_phase_state = threading.local()
+
+
+def _synchronize_device() -> None:
+    """Make private model phase timings reflect completed CUDA work."""
+    if DEVICE.startswith("cuda"):
+        torch.cuda.synchronize()
+
+
+def _instrument_model_phase(owner: object, method_name: str, phase_name: str) -> None:
+    """Measure a private Chatterbox phase only while a request opts in."""
+    original = getattr(owner, method_name)
+
+    def measured(*args, **kwargs):
+        timings = getattr(_phase_state, "timings", None)
+        if timings is None:
+            return original(*args, **kwargs)
+        _synchronize_device()
+        started = time.monotonic()
+        try:
+            return original(*args, **kwargs)
+        finally:
+            _synchronize_device()
+            timings[phase_name] = time.monotonic() - started
+
+    setattr(owner, method_name, measured)
+
+
+# Chatterbox generate() does not expose its S3Gen diffusion-step setting.
+# Preserve the upstream default of 10 while allowing measured deployment tuning.
+_original_s3_inference = model.s3gen.inference
+
+
+def _configured_s3_inference(*args, **kwargs):
+    kwargs.setdefault("n_cfm_timesteps", CFM_STEPS)
+    return _original_s3_inference(*args, **kwargs)
+
+
+model.s3gen.inference = _configured_s3_inference
+
+# Chatterbox also does not expose phase hooks. These narrow wrappers let us
+# distinguish autoregressive generation, diffusion/flow, and vocoding while
+# retaining the rest of the upstream generation implementation and output.
+_instrument_model_phase(model.t3, "inference", "t3_s")
+_instrument_model_phase(model.s3gen, "flow_inference", "s3_flow_s")
+_instrument_model_phase(model.s3gen, "hift_inference", "hift_s")
 
 
 def _normalize_input(value: str) -> str:
@@ -97,7 +153,12 @@ def split_speech_text(value: str) -> list[str]:
     remaining = _normalize_input(value)
     chunks: list[str] = []
     while remaining:
-        limit = FIRST_CHUNK_CHARS if not chunks else LATER_CHUNK_CHARS
+        if not chunks:
+            limit = FIRST_CHUNK_CHARS
+        elif len(chunks) == 1:
+            limit = SECOND_CHUNK_CHARS
+        else:
+            limit = LATER_CHUNK_CHARS
         end = _prefix_length(remaining, limit, not chunks)
         chunk = remaining[:end].strip()
         if chunk:
@@ -216,19 +277,58 @@ def _voice_path(voice: str | None) -> str | None:
     return candidate if os.path.isfile(candidate) else None
 
 
-def _generate_audio(text: str, voice_path: str | None, exaggeration: float, fmt: str) -> bytes:
-    """Atomically select mutable conditionals and synthesize one chunk."""
+def _generate_audio(
+    text: str,
+    voice_path: str | None,
+    exaggeration: float,
+    fmt: str,
+    phase_timings: dict[str, float] | None = None,
+) -> bytes:
+    """Atomically select conditionals and synthesize one instrumented chunk."""
+    total_started = time.monotonic()
+    lock_started = total_started
     with _synthesis_lock:
-        _ensure_conditionals(voice_path, exaggeration)
-        wav = model.generate(text, exaggeration=exaggeration)
-        return _encode(wav, fmt)
+        lock_acquired = time.monotonic()
+        timings: dict[str, float] = {}
+        _phase_state.timings = timings
+        try:
+            conditionals_started = time.monotonic()
+            _ensure_conditionals(voice_path, exaggeration)
+            timings["conditionals_s"] = time.monotonic() - conditionals_started
+
+            generate_started = time.monotonic()
+            wav = model.generate(text, exaggeration=exaggeration)
+            timings["model_generate_s"] = time.monotonic() - generate_started
+
+            encode_started = time.monotonic()
+            audio_bytes = _encode(wav, fmt)
+            timings["encode_s"] = time.monotonic() - encode_started
+        finally:
+            del _phase_state.timings
+
+    timings["lock_wait_s"] = lock_acquired - lock_started
+    timings["model_other_s"] = max(
+        0.0,
+        timings.get("model_generate_s", 0.0)
+        - timings.get("t3_s", 0.0)
+        - timings.get("s3_flow_s", 0.0)
+        - timings.get("hift_s", 0.0),
+    )
+    timings["total_s"] = time.monotonic() - total_started
+    if phase_timings is not None:
+        phase_timings.update(timings)
+    return audio_bytes
 
 
 @app.get("/health")
 def health():
     return jsonify({
         "status": "ok", "model": "chatterbox", "device": DEVICE,
-        "sample_rate": SAMPLE_RATE, "uptime_s": round(time.time() - START_TIME, 1),
+        "sample_rate": SAMPLE_RATE, "cfm_steps": CFM_STEPS,
+        "first_chunk_chars": FIRST_CHUNK_CHARS,
+        "second_chunk_chars": SECOND_CHUNK_CHARS,
+        "later_chunk_chars": LATER_CHUNK_CHARS,
+        "uptime_s": round(time.time() - START_TIME, 1),
     })
 
 
@@ -307,7 +407,7 @@ def speech_stream():
     accepted_at = time.monotonic()
     log.info("voice.tts.stream_accepted", extra={
         "request_id": request_id, "chars_in": len(_text), "chunk_count": len(chunks),
-        "voice": voice, "speed": speed,
+        "voice": voice, "speed": speed, "cfm_steps": CFM_STEPS,
     })
 
     def generate_stream():
@@ -326,7 +426,10 @@ def speech_stream():
                         chunk_span.set_attribute("client.request.id", request_id)
                         chunk_span.set_attribute("voice.tts.chunk.index", index)
                         chunk_span.set_attribute("voice.tts.chunk.chars", len(chunk))
-                        audio_bytes = _generate_audio(chunk, voice_path, exaggeration, "wav")
+                        phase_timings: dict[str, float] = {}
+                        audio_bytes = _generate_audio(
+                            chunk, voice_path, exaggeration, "wav", phase_timings,
+                        )
                         elapsed = round(time.monotonic() - started, 3)
                         audio_duration = round(max(0, len(audio_bytes) - 44) / (SAMPLE_RATE * 2), 3)
                         realtime_factor = round(elapsed / audio_duration, 3) if audio_duration else 0
@@ -334,11 +437,18 @@ def speech_stream():
                         chunk_span.set_attribute("voice.tts.chunk.duration_s", elapsed)
                         chunk_span.set_attribute("voice.tts.chunk.audio_duration_s", audio_duration)
                         chunk_span.set_attribute("voice.tts.chunk.realtime_factor", realtime_factor)
+                        for phase_name, phase_elapsed in phase_timings.items():
+                            chunk_span.set_attribute(
+                                f"voice.tts.chunk.phase.{phase_name}", round(phase_elapsed, 4),
+                            )
                     log.info("voice.tts.stream_chunk_ready", extra={
                         "request_id": request_id, "index": index, "chars_in": len(chunk),
                         "audio_bytes": len(audio_bytes), "elapsed_s": elapsed,
                         "audio_duration_s": audio_duration, "realtime_factor": realtime_factor,
                         "voice": voice,
+                        "phase_timings_s": {
+                            name: round(value, 4) for name, value in phase_timings.items()
+                        },
                     })
                     yield _audio_record(index, audio_bytes)
                 total_elapsed = round(time.monotonic() - accepted_at, 3)
