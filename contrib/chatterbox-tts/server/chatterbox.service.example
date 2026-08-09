@@ -1,0 +1,25 @@
+[Unit]
+Description=Chatterbox TTS Service (OpenAI-compatible)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chatterbox
+Group=chatterbox
+SupplementaryGroups=video render
+WorkingDirectory=/opt/chatterbox
+Environment="PORT=9004"
+Environment="CHATTERBOX_DEVICE=cuda"
+Environment="VOICES_DIR=/opt/chatterbox-voices"
+Environment="OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317"
+Environment="OTEL_EXPORTER_OTLP_PROTOCOL=grpc"
+Environment="OTEL_SERVICE_NAME=voice-tts-chatterbox"
+Environment="DEPLOYMENT_ENVIRONMENT=production"
+Environment="LOG_LEVEL=INFO"
+ExecStart=/opt/chatterbox-env/bin/python3 /opt/chatterbox/chatterbox-service.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
