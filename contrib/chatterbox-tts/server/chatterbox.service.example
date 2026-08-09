@@ -12,6 +12,11 @@ WorkingDirectory=/opt/chatterbox
 Environment="PORT=9004"
 Environment="CHATTERBOX_DEVICE=cuda"
 Environment="VOICES_DIR=/opt/chatterbox-voices"
+# Measured Quadro P2200 profile; verify quality and buffering on the target GPU.
+Environment="CHATTERBOX_CFM_STEPS=7"
+Environment="CHATTERBOX_FIRST_CHUNK_CHARS=160"
+Environment="CHATTERBOX_SECOND_CHUNK_CHARS=80"
+Environment="CHATTERBOX_LATER_CHUNK_CHARS=120"
 Environment="OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317"
 Environment="OTEL_EXPORTER_OTLP_PROTOCOL=grpc"
 Environment="OTEL_SERVICE_NAME=voice-tts-chatterbox"
