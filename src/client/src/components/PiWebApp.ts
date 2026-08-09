@@ -211,6 +211,7 @@ export class PiWebApp extends LitElement {
   private readonly browserResume = new BrowserResumeController({
     onResumeSignal: () => { this.handleBrowserResumeSignal(); },
     onNetworkOnline: () => { this.reconnectBrowserTransports(); },
+    onStaleResume: () => { this.reconnectBrowserTransports(); },
     refreshAfterResume: () => this.refreshAfterBrowserResume(),
     onRefreshError: (error) => { console.warn("Failed to refresh after browser resume", error); },
   });
