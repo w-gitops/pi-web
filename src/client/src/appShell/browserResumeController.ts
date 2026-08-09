@@ -12,6 +12,7 @@ interface ScheduledFrame {
 export interface BrowserResumeCallbacks {
   onResumeSignal(): void;
   onNetworkOnline(): void;
+  onStaleResume(): void;
   refreshAfterResume(): void | Promise<void>;
   onRefreshError(error: unknown): void;
 }
@@ -21,7 +22,11 @@ export interface BrowserResumeControllerOptions {
   documentTarget?: BrowserEventTarget | undefined;
   isDocumentVisible?: (() => boolean) | undefined;
   scheduleFrame?: ((callback: () => void) => ScheduledFrame) | undefined;
+  now?: (() => number) | undefined;
+  staleResumeMs?: number | undefined;
 }
+
+const DEFAULT_STALE_RESUME_MS = 10_000;
 
 /** Owns browser resume listeners and batches focus/visibility refreshes per frame. */
 export class BrowserResumeController {
@@ -29,8 +34,11 @@ export class BrowserResumeController {
   private readonly documentTarget: BrowserEventTarget | undefined;
   private readonly isDocumentVisible: () => boolean;
   private readonly scheduleFrame: (callback: () => void) => ScheduledFrame;
+  private readonly now: () => number;
+  private readonly staleResumeMs: number;
   private readonly refreshes = new TrailingRefreshCoordinator<"browser-resume">();
   private scheduledRefresh: ScheduledFrame | undefined;
+  private lastResumeSignalAt: number | undefined;
   private connected = false;
 
   constructor(private readonly callbacks: BrowserResumeCallbacks, options: BrowserResumeControllerOptions = {}) {
@@ -38,13 +46,17 @@ export class BrowserResumeController {
     this.documentTarget = options.documentTarget ?? browserDocumentTarget();
     this.isDocumentVisible = options.isDocumentVisible ?? documentIsVisible;
     this.scheduleFrame = options.scheduleFrame ?? scheduleBrowserFrame;
+    this.now = options.now ?? wallClockNow;
+    this.staleResumeMs = options.staleResumeMs ?? DEFAULT_STALE_RESUME_MS;
   }
 
   connect(): void {
     if (this.connected) return;
     this.connected = true;
+    this.lastResumeSignalAt = this.now();
     this.windowTarget?.addEventListener("focus", this.onFocus);
     this.windowTarget?.addEventListener("online", this.onOnline);
+    this.windowTarget?.addEventListener("pageshow", this.onPageShow);
     this.documentTarget?.addEventListener("visibilitychange", this.onVisibilityChange);
   }
 
@@ -53,9 +65,11 @@ export class BrowserResumeController {
     this.connected = false;
     this.windowTarget?.removeEventListener("focus", this.onFocus);
     this.windowTarget?.removeEventListener("online", this.onOnline);
+    this.windowTarget?.removeEventListener("pageshow", this.onPageShow);
     this.documentTarget?.removeEventListener("visibilitychange", this.onVisibilityChange);
     this.scheduledRefresh?.cancel();
     this.scheduledRefresh = undefined;
+    this.lastResumeSignalAt = undefined;
   }
 
   private readonly onFocus: EventListener = () => {
@@ -68,10 +82,18 @@ export class BrowserResumeController {
 
   private readonly onOnline: EventListener = () => {
     this.callbacks.onNetworkOnline();
+    this.handleResumeSignal(true);
+  };
+
+  private readonly onPageShow: EventListener = () => {
     this.handleResumeSignal();
   };
 
-  private handleResumeSignal(): void {
+  private handleResumeSignal(transportAlreadyRecovered = false): void {
+    const now = this.now();
+    const stale = this.lastResumeSignalAt !== undefined && now - this.lastResumeSignalAt >= this.staleResumeMs;
+    this.lastResumeSignalAt = now;
+    if (stale && !transportAlreadyRecovered) this.callbacks.onStaleResume();
     this.callbacks.onResumeSignal();
     if (this.scheduledRefresh !== undefined) return;
     this.scheduledRefresh = this.scheduleFrame(() => {
@@ -90,6 +112,12 @@ function browserWindowTarget(): BrowserEventTarget | undefined {
 
 function browserDocumentTarget(): BrowserEventTarget | undefined {
   return typeof document === "undefined" ? undefined : document;
+}
+
+// Wall-clock time intentionally advances while a mobile browser is suspended;
+// performance.now() may pause during device sleep on some platforms.
+function wallClockNow(): number {
+  return Date.now();
 }
 
 function documentIsVisible(): boolean {

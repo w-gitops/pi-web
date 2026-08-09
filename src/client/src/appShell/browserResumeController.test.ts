@@ -40,6 +40,7 @@ describe("BrowserResumeController", () => {
     const controller = new BrowserResumeController({
       onResumeSignal,
       onNetworkOnline,
+      onStaleResume: () => undefined,
       refreshAfterResume: async () => {
         refreshCalls += 1;
         refreshStarted.resolve(undefined);
@@ -98,6 +99,7 @@ describe("BrowserResumeController", () => {
     const controller = new BrowserResumeController({
       onResumeSignal: () => undefined,
       onNetworkOnline: () => undefined,
+      onStaleResume: () => undefined,
       refreshAfterResume: async () => {
         refreshCalls += 1;
         if (refreshCalls === 1) {
@@ -145,6 +147,7 @@ describe("BrowserResumeController", () => {
     const controller = new BrowserResumeController({
       onNetworkOnline: () => { calls.push("online"); },
       onResumeSignal: () => { calls.push("resume"); },
+      onStaleResume: () => { calls.push("stale"); },
       refreshAfterResume: () => { calls.push("refresh"); },
       onRefreshError: (error) => { throw error; },
     }, {
@@ -166,5 +169,39 @@ describe("BrowserResumeController", () => {
     controller.disconnect();
     windowTarget.dispatchEvent(new Event("online"));
     expect(calls).toEqual(["online", "resume", "refresh"]);
+  });
+
+  it("replaces transports once after a long mobile-style suspension without an online event", async () => {
+    const windowTarget = new EventTarget();
+    const documentTarget = new EventTarget();
+    const frames = frameHarness();
+    const calls: string[] = [];
+    let now = 1_000;
+    const controller = new BrowserResumeController({
+      onNetworkOnline: () => { calls.push("online"); },
+      onResumeSignal: () => { calls.push("resume"); },
+      onStaleResume: () => { calls.push("stale"); },
+      refreshAfterResume: () => undefined,
+      onRefreshError: (error) => { throw error; },
+    }, {
+      windowTarget,
+      documentTarget,
+      isDocumentVisible: () => true,
+      scheduleFrame: frames.scheduleFrame,
+      now: () => now,
+      staleResumeMs: 10_000,
+    });
+    controller.connect();
+
+    now += 30_000;
+    documentTarget.dispatchEvent(new Event("visibilitychange"));
+    windowTarget.dispatchEvent(new Event("focus"));
+    windowTarget.dispatchEvent(new Event("pageshow"));
+
+    expect(calls).toEqual(["stale", "resume", "resume", "resume"]);
+    expect(frames.pendingCount()).toBe(1);
+    frames.runNext();
+    await Promise.resolve();
+    controller.disconnect();
   });
 });
