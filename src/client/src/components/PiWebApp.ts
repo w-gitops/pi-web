@@ -2134,7 +2134,7 @@ export class PiWebApp extends LitElement {
         <main class=${mainViewClass(state.mainView)}>
           ${this.renderContextBar()}
           ${this.renderMobileMainTabs()}
-          ${state.error ? html`<div class="error">${state.error}</div>` : null}
+          ${state.error ? html`<div class="error app-error" role="alert"><span>${state.error}</span><button type="button" aria-label="Dismiss error" @click=${() => { this.setState({ error: "" }); }}>×</button></div>` : null}
           <div class="mobile-navigation-panel">${this.appShell.isMobileNavigationLayout ? this.renderNavigationPanel() : null}</div>
           ${state.selectedSession ? html`
             ${this.renderChatView(state, state.selectedSession)}

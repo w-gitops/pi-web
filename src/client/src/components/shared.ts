@@ -173,6 +173,10 @@ export const appStyles = css`
   button { border: 1px solid var(--pi-border); border-radius: 8px; background: var(--pi-surface); color: var(--pi-text); padding: 7px 9px; cursor: pointer; }
   .empty { margin: auto; color: var(--pi-muted); }
   .error { padding: 10px 16px; border-bottom: 1px solid var(--pi-border); color: var(--pi-danger); }
+  .app-error { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .app-error span { min-width: 0; overflow-wrap: anywhere; }
+  .app-error button { flex: 0 0 auto; border: 0; background: transparent; color: inherit; padding: 0 4px; font: inherit; font-size: 20px; line-height: 1; cursor: pointer; }
+  .app-error button:hover, .app-error button:focus-visible { color: var(--pi-text); }
 `;
 
 export const workspacePanelStyles = css`
