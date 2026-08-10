@@ -1044,6 +1044,10 @@ export function setLiveRegionText(region, text) {
   if (region && region.textContent !== text) region.textContent = text;
 }
 
+export function shouldStopForDetachedButton(run, chatRoot) {
+  return Boolean(run && run.mode !== "auto" && !chatRoot.contains?.(run.button));
+}
+
 export function createCoalescedCallback(
   callback,
   schedule = globalThis.queueMicrotask?.bind(globalThis) ?? ((task) => Promise.resolve().then(task)),
@@ -1437,7 +1441,14 @@ function createBrowserRuntime() {
         setButtonState(button, player.activeRun.source ? "playing" : "loading");
       }
     });
-    if (player.activeRun && !chatRoot.contains?.(player.activeRun.button)) player.stop();
+    if (shouldStopForDetachedButton(player.activeRun, chatRoot)) {
+      player.stop();
+    } else if (player.activeRun?.mode === "auto"
+      && !chatRoot.contains?.(player.activeRun.button)) {
+      // Follow-up queue rendering can temporarily remove the prior assistant
+      // element. The Auto-Read controller owns run lifetime across that gap.
+      player.activeRun.button = undefined;
+    }
   };
 
   const discover = () => {
