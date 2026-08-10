@@ -20,8 +20,8 @@ CONSTANTS = {
     "MAX_VOICE_CHARS", "MAX_MODEL_CHARS", "STREAM_FIELDS", "_SENTENCE_END",
 }
 FUNCTIONS = {
-    "_normalize_input", "_prefix_length", "split_speech_text", "_ndjson_line",
-    "_audio_record", "_validate_stream_payload",
+    "_resolve_model_variant", "_resolve_cfm_steps", "_normalize_input", "_prefix_length",
+    "split_speech_text", "_ndjson_line", "_audio_record", "_validate_stream_payload",
 }
 
 
@@ -44,6 +44,32 @@ H: Any = load_pure_helpers()
 
 
 class StreamHelperTests(unittest.TestCase):
+    def test_model_variant_aliases(self):
+        resolve = H["_resolve_model_variant"]
+        self.assertEqual(resolve("default"), ("default", "chatterbox"))
+        self.assertEqual(resolve(" CHATTERBOX "), ("default", "chatterbox"))
+        self.assertEqual(resolve("turbo"), ("turbo", "chatterbox-turbo"))
+        self.assertEqual(resolve("CHATTERBOX-TURBO"), ("turbo", "chatterbox-turbo"))
+        with self.assertRaisesRegex(ValueError, "CHATTERBOX_MODEL"):
+            resolve("unknown")
+
+    def test_model_specific_cfm_steps(self):
+        resolve = H["_resolve_cfm_steps"]
+        self.assertEqual(resolve("default", None), 10)
+        self.assertEqual(resolve("default", "7"), 7)
+        self.assertEqual(resolve("turbo", None), 2)
+        self.assertEqual(resolve("turbo", "2"), 2)
+        with self.assertRaisesRegex(ValueError, "fixed two-step"):
+            resolve("turbo", "7")
+        for value in ("0", "51"):
+            with self.assertRaisesRegex(ValueError, "between 1 and 50"):
+                resolve("default", value)
+
+    def test_turbo_model_wiring_is_present(self):
+        source = ast.unparse(TREE)
+        self.assertIn("from chatterbox.tts_turbo import ChatterboxTurboTTS as ChatterboxModel", source)
+        self.assertIn("'inference_turbo' if MODEL_VARIANT == 'turbo' else 'inference'", source)
+
     def test_sentence_whitespace_and_hard_cut_boundaries(self):
         split = H["split_speech_text"]
         text = "  Quick first.   Second sentence stays here.  " + "word " * 140

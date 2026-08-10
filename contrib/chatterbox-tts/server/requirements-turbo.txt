@@ -1,0 +1,9 @@
+# Turbo support was added after the 0.1.7 PyPI release. Pin the tested source revision.
+chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git@5de7a54
+flask
+flask-cors
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-flask
+opentelemetry-instrumentation-requests
