@@ -13,6 +13,11 @@ export const MAX_WIRE_BYTES = Math.ceil(MAX_AUDIO_BYTES * 4 / 3) + (MAX_STREAM_C
 export const STREAM_PROTOCOL_VERSION = "1";
 export const AUDIO_TRIM_PADDING_SECONDS = 0.04;
 export const AUDIO_BOUNDARY_OVERLAP_SECONDS = 0.04;
+export const AUTO_READ_POLL_MS = 100;
+export const AUTO_READ_HIDDEN_POLL_MS = 1_000;
+export const MAX_AUTO_QUEUE_CHARS = 2_000;
+export const MAX_AUTO_QUEUE_SEGMENTS = 8;
+export const MAX_AUTO_SOURCE_CHARS = 20_000;
 
 export const STORAGE_KEY = "pi-web.chatterbox-tts.settings.v1";
 export const DIRECT_ENDPOINT = "http://192.168.200.42:9004";
@@ -29,12 +34,14 @@ export const DEFAULT_SETTINGS = Object.freeze({
   endpoint: defaultEndpoint(),
   voice: "alloy",
   speed: 1,
+  autoRead: false,
 });
 
 export const DOM_CONTRACT = Object.freeze({
   appSelector: "pi-web-app",
   chatSelector: "chat-view",
   assistantSelector: "article.msg.assistant, section.group-msg.assistant",
+  userSelector: "article.msg.user",
   actionSelector: ":scope > .msg-header .msg-actions",
   directPartSelector: ":scope > formatted-text.part",
   buttonMarker: "data-chatterbox-tts",
@@ -75,11 +82,12 @@ export function validateSettings(candidate, options = {}) {
   const endpoint = validateEndpoint(candidate.endpoint, options.pageProtocol);
   const voice = typeof candidate.voice === "string" ? candidate.voice.trim() : "";
   const speed = typeof candidate.speed === "number" ? candidate.speed : Number(candidate.speed);
+  const autoRead = candidate.autoRead === true;
   if (!voice) throw errorWithCode("Voice cannot be empty.", "voice");
   if (!Number.isFinite(speed) || speed < 0.25 || speed > 4) {
     throw errorWithCode("Speed must be from 0.25 to 4.", "speed");
   }
-  return { endpoint, voice, speed };
+  return { endpoint, voice, speed, autoRead };
 }
 
 export function loadSettings(storage = globalThis.localStorage, locationObject = globalThis.location) {
@@ -134,6 +142,87 @@ export function markdownToSpeech(markdown) {
     .replace(/\r?\n+/g, " ")
     .replace(/\s+/gu, " ")
     .trim());
+}
+
+function proseOutsideFences(markdown) {
+  const output = [];
+  let fence;
+  for (const line of markdown.split(/(?<=\n)/)) {
+    const body = line.replace(/\r?\n$/u, "");
+    if (!fence) {
+      const backtick = body.match(/^\s{0,3}(`{3,})[^`]*$/u)?.[1];
+      const tilde = body.match(/^\s{0,3}(~{3,}).*$/u)?.[1];
+      const marker = backtick ?? tilde;
+      if (marker) {
+        fence = { character: marker[0], length: marker.length };
+        continue;
+      }
+    } else {
+      const closing = body.match(/^\s{0,3}(`{3,}|~{3,})[\t ]*$/u)?.[1];
+      if (closing && closing[0] === fence.character && closing.length >= fence.length) {
+        fence = undefined;
+        continue;
+      }
+    }
+    if (!fence) output.push(line);
+  }
+  return output.join("");
+}
+
+function stableInlinePrefix(markdown) {
+  const output = [];
+  const opens = [];
+  let escaped = false;
+  for (let index = 0; index < markdown.length; index += 1) {
+    const character = markdown[index];
+    if (escaped) { output.push(character); escaped = false; continue; }
+    if (character === "\\") { output.push(character); escaped = true; continue; }
+    if (character === "`") {
+      const marker = markdown.slice(index).match(/^`+/u)?.[0] ?? "`";
+      const closeAt = markdown.indexOf(marker, index + marker.length);
+      if (closeAt < 0) return output.join("");
+      output.push(" ");
+      index = closeAt + marker.length - 1;
+      continue;
+    }
+    const top = opens.at(-1);
+    if (character === "<" && /[A-Za-z!/?]/u.test(markdown[index + 1] ?? "")) {
+      opens.push({ type: "angle", outputIndex: output.length });
+    }
+    else if (character === ">" && top?.type === "angle") opens.pop();
+    else if (character === "[") opens.push({
+      type: "bracket", outputIndex: Math.max(0, output.length - (output.at(-1) === "!" ? 1 : 0)),
+    });
+    else if (character === "]" && top?.type === "bracket") {
+      opens.pop();
+      if (markdown[index + 1] === "(") opens.push({ type: "link", outputIndex: top.outputIndex });
+    } else if (character === ")" && top?.type === "link") opens.pop();
+    output.push(character);
+  }
+  if (escaped) output.pop();
+  if (opens.length) output.length = Math.min(...opens.map((open) => open.outputIndex));
+  return output.join("");
+}
+
+function stableSentenceEnd(speech) {
+  const matcher = /[.!?\u3002\uff01\uff1f]+["'\u201d\u2019)]*(?=\s|$)/gu;
+  const abbreviation = /(?:\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc)|\b[A-Za-z]|\be\.g|\bi\.e)\.$/iu;
+  let end = 0;
+  for (const match of speech.matchAll(matcher)) {
+    const candidate = speech.slice(0, match.index + match[0].length);
+    if (!abbreviation.test(candidate) && !/\d\.\d$/u.test(candidate)) end = candidate.length;
+  }
+  return end;
+}
+
+export function streamingSpeechSnapshot(markdown, final = false) {
+  if (typeof markdown !== "string") return { source: "", speech: "" };
+  const bounded = markdown.slice(0, MAX_AUTO_SOURCE_CHARS);
+  const source = stableInlinePrefix(proseOutsideFences(bounded));
+  const speech = markdownToSpeech(source);
+  if (final) return { source: bounded, speech };
+  const end = stableSentenceEnd(speech);
+  return { source: bounded, speech: speech.slice(0, end).trim() };
 }
 
 function graphemeEndAtOrBefore(text, limit) {
@@ -517,6 +606,19 @@ export class ChatterboxPlayer {
     if (!this.isActive(run)) throw errorWithCode("Playback was cancelled.", "stale");
   }
 
+  async primeForAutoplay() {
+    if (!this.context || this.context.state === "closed") this.context = this.createAudioContext();
+    await this.context.resume?.();
+    if (this.context.state !== "running") throw errorWithCode("Tap Enable Auto-Read again to unlock audio.", "autoplay");
+    if (this.context.createBuffer) {
+      const source = this.context.createBufferSource();
+      source.buffer = this.context.createBuffer(1, 1, this.context.sampleRate || 24_000);
+      source.connect(this.context.destination);
+      source.start(0);
+      source.disconnect?.();
+    }
+  }
+
   recordRun(run, outcome, status) {
     if (run.telemetrySent) return;
     run.telemetrySent = true;
@@ -532,6 +634,8 @@ export class ChatterboxPlayer {
     run.cancelled = true;
     this.recordRun(run, "abort");
     run.controller.abort();
+    run.wake?.();
+    run.wake = undefined;
     void run.reader?.cancel();
     run.reader = undefined;
     for (const source of run.sources) {
@@ -557,6 +661,7 @@ export class ChatterboxPlayer {
       id: ++this.nextRunId, messageId, button, controller: new AbortController(),
       source: undefined, sources: new Set(), settlements: new Set(), reader: undefined, cancelled: false,
       requestId: newRequestId(), startedAt: this.now(), telemetrySent: false,
+      mode: "manual", queue: [], queueChars: 0, final: false, wake: undefined, scheduled: undefined,
     });
     this.activeRun = run;
     this.emit(run, "loading", { chunkIndex: 0 });
@@ -629,7 +734,7 @@ export class ChatterboxPlayer {
     });
   }
 
-  async playStream(run, speech, settings) {
+  async playStream(run, speech, settings, options = {}) {
     const firstDeadline = this.now() + FIRST_RECORD_TIMEOUT_MS;
     const firstWait = (promise) => this.withDeadline(
       run, promise, firstDeadline - this.now(), "The first speech chunk timed out.",
@@ -663,7 +768,7 @@ export class ChatterboxPlayer {
     if (record.type === "error") throw errorWithCode(record.error, "server");
     if (record.type !== "audio") throw errorWithCode("The stream completed without audio.", "protocol");
     let prepared = await this.decodeChunk(run, record.audio);
-    let current = await this.schedulePrepared(run, prepared, record.index, undefined);
+    let current = await this.schedulePrepared(run, prepared, record.index, undefined, options.requestedStart);
 
     while (true) {
       if (!this.isActive(run)) throw errorWithCode("Playback was cancelled.", "stale");
@@ -675,7 +780,7 @@ export class ChatterboxPlayer {
       if (outcome.error) throw outcome.error;
       const { successor } = outcome;
       if (successor.record.type === "done") {
-        await current.ended;
+        if (options.waitForPlayback !== false) await current.ended;
         break;
       }
       const nextStart = current.endAt - AUDIO_BOUNDARY_OVERLAP_SECONDS;
@@ -689,7 +794,89 @@ export class ChatterboxPlayer {
     }
     records.release();
     run.reader = undefined;
-    return "streamed";
+    return options.waitForPlayback === false ? { scheduled: current } : "streamed";
+  }
+
+  async startAuto({ messageId, button }) {
+    this.stop();
+    if (!this.context || this.context.state !== "running") {
+      throw errorWithCode("Auto-Read needs a user gesture to unlock audio.", "autoplay");
+    }
+    const run = Object.seal({
+      id: ++this.nextRunId, messageId, button, controller: new AbortController(),
+      source: undefined, sources: new Set(), settlements: new Set(), reader: undefined, cancelled: false,
+      requestId: newRequestId(), startedAt: this.now(), telemetrySent: false,
+      mode: "auto", queue: [], queueChars: 0, final: false, wake: undefined, scheduled: undefined,
+    });
+    this.activeRun = run;
+    this.emit(run, "loading", { chunkIndex: 0 });
+    void this.drainAuto(run);
+    return run;
+  }
+
+  enqueueAuto(run, speech) {
+    const text = typeof speech === "string" ? speech.trim() : "";
+    if (!text || !this.isActive(run) || run.mode !== "auto" || run.final) return false;
+    const separatorChars = run.queue.length >= MAX_AUTO_QUEUE_SEGMENTS ? 1 : 0;
+    if (run.queueChars + separatorChars + text.length > MAX_AUTO_QUEUE_CHARS) return false;
+    if (run.queue.length >= MAX_AUTO_QUEUE_SEGMENTS) {
+      const last = run.queue.length - 1;
+      run.queue[last] = `${run.queue[last]} ${text}`;
+    } else run.queue.push(text);
+    run.queueChars += separatorChars + text.length;
+    run.wake?.();
+    run.wake = undefined;
+    return true;
+  }
+
+  finishAuto(run) {
+    if (!this.isActive(run) || run.mode !== "auto") return;
+    run.final = true;
+    run.wake?.();
+    run.wake = undefined;
+  }
+
+  async drainAuto(run) {
+    try {
+      const settings = validateSettings(this.getSettings(), { pageProtocol: this.pageProtocol?.() });
+      while (this.isActive(run)) {
+        if (run.queue.length) {
+          const speech = run.queue.shift();
+          run.queueChars -= speech.length;
+          run.requestId = newRequestId();
+          const requestedStart = run.scheduled?.endAt === undefined
+            ? undefined : run.scheduled.endAt - AUDIO_BOUNDARY_OVERLAP_SECONDS;
+          const result = await this.playStream(run, speech, settings, {
+            waitForPlayback: false, requestedStart,
+          });
+          run.scheduled = result.scheduled;
+          continue;
+        }
+        if (run.final) {
+          await run.scheduled?.ended;
+          if (!this.isActive(run)) return;
+          this.recordRun(run, "success", 200);
+          this.activeRun = undefined;
+          this.onState({ run, state: "idle" });
+          return;
+        }
+        await new Promise((resolve) => { run.wake = resolve; });
+        run.wake = undefined;
+      }
+    } catch (error) {
+      if (!this.isActive(run) || error?.code === "stale") return;
+      this.recordRun(run, error?.code === "timeout" ? "timeout" : "network");
+      this.logger?.error?.("Chatterbox Auto-Read failed", { requestId: run.requestId, error });
+      this.emit(run, "error", { message: this.publicError(error) });
+      this.activeRun = undefined;
+    } finally {
+      const reader = run.reader;
+      run.reader = undefined;
+      if (reader) {
+        if (this.isActive(run)) reader.release();
+        else void reader.cancel();
+      }
+    }
   }
 
   async nextPreparedStreamRecord(run, records) {
@@ -831,6 +1018,219 @@ let browserRuntime;
 const PLUGIN_UPDATE_INTERVAL_MS = 30_000;
 const PLUGIN_MANIFEST_PATH = "/pi-web-plugins/manifest.json";
 
+export function inspectAutoReadView(root, documentObject = globalThis.document) {
+  const view = root?.host;
+  if (!view || view.shadowRoot !== root || view.isConnected === false) return { available: false };
+  if (typeof view.sessionId !== "string" || typeof view.status?.isStreaming !== "boolean") {
+    return { available: false };
+  }
+  const messages = enumerateAssistantMessages(root);
+  const users = Array.from(root.querySelectorAll?.(DOM_CONTRACT.userSelector) ?? []);
+  const latestAssistant = messages.at(-1);
+  const latestUser = users.at(-1);
+  const assistantIndex = Number(latestAssistant?.getAttribute?.("data-index"));
+  const userIndex = Number(latestUser?.getAttribute?.("data-index"));
+  const assistantFollowsUser = !latestUser || (Number.isFinite(assistantIndex) && assistantIndex > userIndex);
+  const message = assistantFollowsUser ? latestAssistant : undefined;
+  const messageIdentity = message ? deriveMessageIdentity(message, messages.length - 1) : undefined;
+  const responseIdentity = latestUser
+    ? deriveMessageIdentity(latestUser, users.length - 1)
+    : messageIdentity;
+  const button = message?.querySelector?.(`[${DOM_CONTRACT.buttonMarker}]`);
+  return {
+    available: true,
+    view,
+    sessionId: view.sessionId,
+    isStreaming: view.status.isStreaming,
+    hidden: documentObject?.visibilityState === "hidden",
+    turnId: responseIdentity ? `${view.sessionId}:response:${responseIdentity}` : undefined,
+    messageId: messageIdentity ? `${view.sessionId}:assistant:${messageIdentity}` : undefined,
+    message,
+    button,
+    text: message ? extractAssistantText(message) : "",
+  };
+}
+
+export class AutoReadController {
+  constructor(player, dependencies = {}) {
+    this.player = player;
+    const telemetry = dependencies.telemetry ?? recordClientTelemetry;
+    this.telemetry = (event) => telemetry({
+      requestId: newRequestId(), durationMs: 0, ...event,
+    });
+    this.onNotice = dependencies.onNotice ?? (() => {});
+    this.enabled = false;
+    this.generation = 0;
+    this.sessionId = undefined;
+    this.baselineTurnId = undefined;
+    this.turnId = undefined;
+    this.messageId = undefined;
+    this.lastRaw = "";
+    this.committedSpeech = "";
+    this.run = undefined;
+    this.suppressedTurnId = undefined;
+  }
+
+  baseline(snapshot) {
+    this.sessionId = snapshot?.available ? snapshot.sessionId : undefined;
+    this.baselineTurnId = snapshot?.available ? snapshot.turnId : undefined;
+  }
+
+  async enable(snapshot) {
+    const transition = ++this.generation;
+    await this.player.primeForAutoplay();
+    if (transition !== this.generation) return false;
+    this.enabled = true;
+    this.baseline(snapshot);
+    return true;
+  }
+
+  disable(snapshot) {
+    this.enabled = false;
+    this.cancel(false);
+    this.baseline(snapshot);
+  }
+
+  playbackFailed() {
+    this.enabled = false;
+    this.onNotice("Auto-Read paused. Use Enable / Resume to unlock audio again.");
+    this.cancel(true);
+  }
+
+  cancel(suppress = true) {
+    this.generation += 1;
+    if (suppress && this.turnId) this.suppressedTurnId = this.turnId;
+    this.player.stop();
+    this.turnId = undefined;
+    this.messageId = undefined;
+    this.run = undefined;
+    this.lastRaw = "";
+    this.committedSpeech = "";
+  }
+
+  suppressCurrent() { this.cancel(true); }
+
+  enqueueSnapshot(raw, final) {
+    if (typeof raw !== "string" || raw.length > MAX_AUTO_SOURCE_CHARS) {
+      this.cancel(true);
+      return false;
+    }
+    if (this.lastRaw && !raw.startsWith(this.lastRaw)) {
+      this.telemetry?.({ outcome: "auto.revision", sourceChars: raw.length });
+      this.cancel(true);
+      return false;
+    }
+    this.lastRaw = raw;
+    const { speech } = streamingSpeechSnapshot(raw, final);
+    if (!speech.startsWith(this.committedSpeech)) {
+      this.telemetry?.({ outcome: "auto.projection_revision", sourceChars: raw.length });
+      this.cancel(true);
+      return false;
+    }
+    const delta = speech.slice(this.committedSpeech.length).trim();
+    if (delta) {
+      if (!this.player.enqueueAuto(this.run, delta)) {
+        this.telemetry?.({ outcome: "auto.backpressure", queueChars: this.run?.queueChars ?? 0 });
+        this.onNotice("Auto-Read paused because speech fell behind the response.");
+        this.suppressedTurnId = this.turnId;
+        this.player.finishAuto(this.run);
+        this.turnId = undefined;
+        this.messageId = undefined;
+        this.run = undefined;
+        this.lastRaw = "";
+        this.committedSpeech = "";
+        return false;
+      }
+      this.telemetry?.({ outcome: "auto.segment", inputChars: delta.length });
+      this.committedSpeech = speech;
+    }
+    return true;
+  }
+
+  async poll(snapshot) {
+    if (!this.enabled) { this.baseline(snapshot); return; }
+    if (!snapshot?.available || snapshot.hidden) {
+      if (this.turnId) this.cancel(false);
+      this.baseline(snapshot);
+      return;
+    }
+    if (snapshot.sessionId !== this.sessionId) {
+      this.cancel(false);
+      this.baseline(snapshot);
+      return;
+    }
+    if (this.suppressedTurnId) {
+      if (!snapshot.isStreaming || (snapshot.turnId && snapshot.turnId !== this.suppressedTurnId)) {
+        this.baselineTurnId = this.suppressedTurnId;
+        this.suppressedTurnId = undefined;
+        if (!snapshot.isStreaming) { this.baseline(snapshot); return; }
+      } else return;
+    }
+    if (!this.turnId) {
+      if (!snapshot.isStreaming || !snapshot.turnId || !snapshot.messageId || snapshot.turnId === this.baselineTurnId) {
+        if (!snapshot.isStreaming) this.baseline(snapshot);
+        return;
+      }
+      if (this.player.activeRun) {
+        this.telemetry?.({ outcome: "auto.busy" });
+        this.baselineTurnId = snapshot.turnId;
+        return;
+      }
+      const generation = ++this.generation;
+      this.turnId = snapshot.turnId;
+      this.messageId = snapshot.messageId;
+      this.lastRaw = "";
+      this.committedSpeech = "";
+      try {
+        this.run = await this.player.startAuto({
+          messageId: snapshot.messageId, button: snapshot.button,
+        });
+      } catch (error) {
+        if (generation === this.generation) {
+          this.telemetry?.({ outcome: "auto.blocked" });
+          this.enabled = false;
+          this.onNotice("Auto-Read needs a tap on Enable / Resume before it can play audio.");
+          this.cancel(true);
+        }
+        return;
+      }
+      if (generation !== this.generation) return;
+    }
+    if (snapshot.turnId !== this.turnId) {
+      if (!this.enqueueSnapshot(this.lastRaw, true)) return;
+      this.player.finishAuto(this.run);
+      this.baselineTurnId = snapshot.turnId;
+      this.turnId = undefined;
+      this.messageId = undefined;
+      this.run = undefined;
+      this.lastRaw = "";
+      this.committedSpeech = "";
+      return;
+    }
+    if (snapshot.messageId && snapshot.messageId !== this.messageId) {
+      if (!this.enqueueSnapshot(this.lastRaw, true)) return;
+      this.messageId = snapshot.messageId;
+      this.lastRaw = "";
+      this.committedSpeech = "";
+      if (this.run) {
+        this.run.messageId = snapshot.messageId;
+        this.run.button = snapshot.button;
+      }
+    }
+    if (!snapshot.messageId || snapshot.messageId !== this.messageId) return;
+    if (!this.enqueueSnapshot(snapshot.text, !snapshot.isStreaming)) return;
+    if (!snapshot.isStreaming) {
+      this.player.finishAuto(this.run);
+      this.baselineTurnId = this.turnId;
+      this.turnId = undefined;
+      this.messageId = undefined;
+      this.run = undefined;
+      this.lastRaw = "";
+      this.committedSpeech = "";
+    }
+  }
+}
+
 async function reloadForPluginUpdate(player) {
   if (player.activeRun || document.visibilityState !== "visible") return;
   try {
@@ -857,17 +1257,60 @@ function createBrowserRuntime() {
   let observer;
   let timer;
   let updateTimer;
+  let autoTimer;
+  let autoPolling = false;
+  let autoPollPending = false;
+  let disposed = false;
   let warned = false;
   let liveRegion;
 
   const announce = (text) => setLiveRegionText(liveRegion, text);
+  let autoRead;
   const player = new ChatterboxPlayer({
     onState: ({ run, state, message, chunkIndex, chunkCount }) => {
       setButtonState(run.button, state, message);
+      if (run.mode === "auto" && state === "error") autoRead?.playbackFailed();
       const suffix = state === "playing" && chunkCount > 1 ? `, part ${chunkIndex + 1} of ${chunkCount}` : "";
       announce(state === "error" ? message : state === "playing" ? `Speech playing${suffix}` : state === "loading" ? "Generating speech" : "Speech stopped");
     },
   });
+  autoRead = new AutoReadController(player, { onNotice: announce });
+
+  const autoSnapshot = () => inspectAutoReadView(root);
+  const scheduleAutoPoll = (delay) => {
+    window.clearTimeout(autoTimer);
+    if (disposed) return;
+    autoTimer = window.setTimeout(() => {
+      autoTimer = undefined;
+      void pollAutoRead();
+    }, delay);
+  };
+  const pollAutoRead = async () => {
+    if (autoPolling) { autoPollPending = true; return; }
+    autoPolling = true;
+    const snapshot = autoSnapshot();
+    try { await autoRead.poll(snapshot); }
+    finally {
+      autoPolling = false;
+      const immediate = autoPollPending;
+      autoPollPending = false;
+      const fast = autoRead.enabled && snapshot.available && snapshot.isStreaming && !snapshot.hidden;
+      scheduleAutoPoll(immediate ? 0 : fast ? AUTO_READ_POLL_MS : AUTO_READ_HIDDEN_POLL_MS);
+    }
+  };
+
+  const setAutoRead = async (enabled) => {
+    const current = loadSettings();
+    if (enabled) {
+      if (!current.autoRead) {
+        const destination = new URL(current.endpoint).origin;
+        if (!window.confirm(`Auto-Read will automatically send new assistant prose to:\n${destination}\n\nEnable it for this browser?`)) return;
+      }
+      if (!await autoRead.enable(autoSnapshot())) return;
+    } else autoRead.disable(autoSnapshot());
+    saveSettings({ ...current, autoRead: enabled });
+    announce(enabled ? "Auto-Read enabled" : "Auto-Read disabled");
+  };
 
   const reconcile = (chatRoot) => {
     const messages = enumerateAssistantMessages(chatRoot);
@@ -893,6 +1336,7 @@ function createBrowserRuntime() {
       button.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
+        if (autoRead.turnId) autoRead.suppressCurrent();
         void player.toggle({ messageId: button.dataset.messageIdentity, button, text: extractAssistantText(message) });
       });
       actions.prepend(button);
@@ -911,7 +1355,7 @@ function createBrowserRuntime() {
       return;
     }
     if (found !== root) {
-      player.stop();
+      autoRead.cancel(false);
       observer?.disconnect();
       root = found;
       liveRegion = root.querySelector?.(`[${DOM_CONTRACT.liveMarker}]`);
@@ -923,7 +1367,10 @@ function createBrowserRuntime() {
         Object.assign(liveRegion.style, { position: "absolute", width: "1px", height: "1px", overflow: "hidden", clipPath: "inset(50%)" });
         root.append(liveRegion);
       }
-      const scheduleReconcile = createCoalescedCallback(() => reconcile(root));
+      const scheduleReconcile = createCoalescedCallback(() => {
+        reconcile(root);
+        scheduleAutoPoll(0);
+      });
       observer = new MutationObserver(scheduleReconcile);
       observer.observe(root, { childList: true, subtree: true });
     }
@@ -931,12 +1378,30 @@ function createBrowserRuntime() {
   };
   discover();
   timer = window.setInterval(discover, 1000);
+  scheduleAutoPoll(0);
   updateTimer = window.setInterval(() => void reloadForPluginUpdate(player), PLUGIN_UPDATE_INTERVAL_MS);
   window.setTimeout(() => void reloadForPluginUpdate(player), 5_000);
-  browserRuntime = { player, dispose: async () => {
+  let unlockPromise;
+  const unlockPersistedAutoRead = () => {
+    if (!loadSettings().autoRead || autoRead.enabled || unlockPromise) return;
+    unlockPromise = autoRead.enable(autoSnapshot())
+      .catch((error) => console.warn("Chatterbox Auto-Read audio unlock failed", error))
+      .finally(() => { unlockPromise = undefined; });
+  };
+  document.addEventListener("pointerdown", unlockPersistedAutoRead, { capture: true });
+  document.addEventListener("keydown", unlockPersistedAutoRead, { capture: true });
+  browserRuntime = { player, autoRead, setAutoRead, stop: () => {
+    autoRead.suppressCurrent();
+    player.stop();
+  }, dispose: async () => {
+    disposed = true;
     window.clearInterval(timer);
     window.clearInterval(updateTimer);
+    window.clearTimeout(autoTimer);
+    document.removeEventListener("pointerdown", unlockPersistedAutoRead, { capture: true });
+    document.removeEventListener("keydown", unlockPersistedAutoRead, { capture: true });
     observer?.disconnect();
+    autoRead.disable(autoSnapshot());
     await player.dispose();
     browserRuntime = undefined;
   } };
@@ -961,7 +1426,7 @@ async function configureBrowser() {
   const speed = window.prompt("Speed (0.25–4)", String(current.speed));
   if (speed === null) return;
   let next;
-  try { next = validateSettings({ endpoint: endpointInput, voice, speed }); }
+  try { next = validateSettings({ endpoint: endpointInput, voice, speed, autoRead: current.autoRead }); }
   catch (error) { window.alert(error.message); return; }
   const oldOrigin = new URL(current.endpoint).origin;
   const newOrigin = new URL(next.endpoint).origin;
@@ -984,7 +1449,9 @@ const plugin = {
       contributions: {
         actions: [
           { id: "configure", title: "Configure Chatterbox TTS", description: "Set and check the browser-local speech server, voice, and speed", group: "Voice", run: configureBrowser },
-          { id: "stop", title: "Stop Chatterbox Speech", description: "Stop current synthesis or playback", group: "Voice", enabled: () => Boolean(runtime?.player.activeRun), run: () => runtime?.player.stop() },
+          { id: "enable-auto-read", title: "Enable / Resume Chatterbox Auto-Read", description: "Unlock audio and read new assistant responses while they stream", group: "Voice", enabled: () => !runtime?.autoRead.enabled, run: () => runtime?.setAutoRead(true) },
+          { id: "disable-auto-read", title: "Disable Chatterbox Auto-Read", description: "Stop speech and disable automatic reading", group: "Voice", enabled: () => Boolean(runtime?.autoRead.enabled || loadSettings().autoRead), run: () => runtime?.setAutoRead(false) },
+          { id: "stop", title: "Stop Chatterbox Speech", description: "Stop current synthesis or playback and suppress the rest of this turn", group: "Voice", enabled: () => Boolean(runtime?.player.activeRun), run: () => runtime?.stop() },
           { id: "reload", title: "Reload Chatterbox TTS", description: "Reload PI WEB to activate the latest local TTS plugin version", group: "Voice", run: () => window.location.reload() },
         ],
         workspacePanels: [],

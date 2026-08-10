@@ -18,7 +18,7 @@ mkdir -p ~/.pi-web/plugins
 ln -s "$PWD/contrib/chatterbox-tts/plugin" ~/.pi-web/plugins/chatterbox-tts
 ```
 
-Enable `chatterbox-tts` in **Settings → PI WEB plugins**. The action palette provides configuration, stop, and reload actions.
+Enable `chatterbox-tts` in **Settings → PI WEB plugins**. The action palette provides configuration, Auto-Read enable/disable, stop, and reload actions. **Enable / Resume Chatterbox Auto-Read** primes Web Audio from a user gesture; mobile browsers may require this again after a page load or audio interruption. The browser-local preference also primes on the first subsequent pointer or keyboard gesture.
 
 On HTTPS pages, the default endpoint is the same-origin `/chatterbox-tts` route. On HTTP pages, the deployment default is `http://192.168.200.42:9004`; use **Configure Chatterbox TTS** to change it. Assistant text is sent to the configured endpoint, so only use a server you trust.
 
@@ -97,7 +97,7 @@ Keep the route behind the same authentication boundary as PI WEB.
 
 ## Streaming behavior
 
-The plugin posts one immutable cleaned message to `/v1/audio/speech/stream`. The server normalizes and splits it at configurable sentence/whitespace boundaries, synthesizes chunks serially, and yields base64 PCM16 WAV records over bounded NDJSON. The browser:
+Manual playback posts one immutable cleaned message to `/v1/audio/speech/stream`. The server normalizes and splits it at configurable sentence/whitespace boundaries, synthesizes chunks serially, and yields base64 PCM16 WAV records over bounded NDJSON. The browser:
 
 - validates MIME type, protocol version, record ordering, WAV shape, and byte/count limits;
 - starts after the first record and decodes at most one successor ahead;
@@ -107,6 +107,12 @@ The plugin posts one immutable cleaned message to `/v1/audio/speech/stream`. The
 - cancels the fetch, reader, and every scheduled source when stopped.
 
 The first-record deadline is 75 seconds and each later stream read has a separate 90-second idle deadline. HTTP 404 or 405 before any stream record falls back to the legacy `/v1/audio/speech` endpoint. Other transport, protocol, or synthesis errors do not silently retry.
+
+### Streaming Auto-Read
+
+Sentence-safe Auto-Read polls only the active PI WEB `chat-view` adapter while a response streams, because token updates inside nested `formatted-text` shadow roots are not guaranteed to reach the outer observer. Existing messages are baselined and never read automatically. Completed prose sentences are queued once; fenced code and incomplete inline Markdown constructs remain unspoken, and the final safe tail flushes when streaming ends.
+
+Each queued segment gets a serial NDJSON request. The next request begins as soon as the previous response has been scheduled—not after its audio finishes—so Turbo can generate the successor during playback. The queue is bounded to eight pending segments and 2,000 characters. A source revision, queue overflow, navigation, hidden page, missing private-DOM contract, stop, or disable fails closed and cancels queued/scheduled work. Stop suppresses only the current streaming turn. Continuous playback depends on successor audio arriving before the current timeline ends; underruns start immediately rather than delaying playback further.
 
 ## Observability
 
