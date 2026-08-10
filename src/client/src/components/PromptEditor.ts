@@ -34,6 +34,7 @@ export class PromptEditor extends LitElement {
   @property({ type: Boolean }) canStop = false;
   @property({ attribute: false }) status?: SessionStatus;
   @property({ type: Boolean }) sending = false;
+  @property({ type: Boolean }) reconnecting = false;
   @property({ attribute: false }) onSend?: (text: string, streamingBehavior?: "steer" | "followUp", attachments?: PromptAttachment[], delivery?: PromptAttachmentDelivery) => void | Promise<void>;
   @property({ attribute: false }) onStop?: () => void;
   @property({ attribute: false }) onSelectModel?: () => void;
@@ -105,7 +106,7 @@ export class PromptEditor extends LitElement {
     const shellInputMode = this.currentInputMode.kind === "shell" ? this.currentInputMode : undefined;
     const shellMode = shellInputMode !== undefined;
     const queuesInput = this.canSteer || this.isCompacting;
-    const busy = this.disabled || this.sending;
+    const busy = this.disabled || this.sending || this.reconnecting;
     return html`
       <footer class=${shellMode ? "shell-mode" : ""} @paste=${(event: ClipboardEvent) => { void this.handlePaste(event); }} @dragover=${(event: DragEvent) => { this.handleDragOver(event); }} @drop=${(event: DragEvent) => { void this.handleDrop(event); }}>
         <div class="editor-wrap">
@@ -113,13 +114,14 @@ export class PromptEditor extends LitElement {
           <input class="attachment-input" type="file" multiple hidden @change=${(event: Event) => { void this.handleFileInput(event); }} />
           <button class="editor-attach icon-button" ?disabled=${busy} title="Attach files" aria-label="Attach files" @click=${() => { this.attachmentInput?.click(); }}>${renderAttachIcon()}</button>
           ${shellMode ? html`<div class="mode-hint">Shell command${shellInputMode.excludeFromContext ? " · excluded from context" : ""}</div>` : null}
-          ${this.isCompacting && !shellMode ? html`<div class="mode-hint">Compacting history · message will be queued</div>` : null}
+          ${this.reconnecting ? html`<div class="mode-hint">Reconnecting…</div>` : null}
+          ${this.isCompacting && !shellMode && !this.reconnecting ? html`<div class="mode-hint">Compacting history · message will be queued</div>` : null}
           ${this.renderAttachments()}
           <autocomplete-menu .items=${this.completions} .selectedIndex=${this.selectedIndex} .onPick=${(item: CompletionItem) => { this.pick(item); }}></autocomplete-menu>
         </div>
         <div class="actions">
           ${this.renderCompactStatus()}
-          <button class="icon-button send-button" ?disabled=${busy} title=${queuesInput ? "Queue until the current activity finishes" : "Send message"} aria-label=${queuesInput ? "Queue message" : "Send message"} @click=${() => { this.send("followUp"); }}>${queuesInput ? renderQueueIcon() : renderSendIcon()}</button>
+          <button class="icon-button send-button" ?disabled=${busy} title=${this.reconnecting ? "Waiting for the connection to recover" : queuesInput ? "Queue until the current activity finishes" : "Send message"} aria-label=${this.reconnecting ? "Reconnecting" : queuesInput ? "Queue message" : "Send message"} @click=${() => { this.send("followUp"); }}>${queuesInput ? renderQueueIcon() : renderSendIcon()}</button>
           ${this.canSteer && !this.isCompacting ? html`<button class="icon-button steer-button" ?disabled=${busy} title="Steer the current response before the next model call" aria-label="Steer current response" @click=${() => { this.send("steer"); }}>${renderSteerIcon()}</button>` : null}
           <button class="icon-button stop-button" ?disabled=${this.disabled || !this.canStop} title=${this.canStop ? "Stop current work and clear queued messages" : "Nothing running"} aria-label="Stop current work" @click=${() => this.onStop?.()}>${renderStopIcon()}</button>
         </div>
@@ -467,7 +469,7 @@ export class PromptEditor extends LitElement {
   }
 
   private send(streamingBehavior?: "steer" | "followUp") {
-    if (this.disabled || this.sending) return;
+    if (this.disabled || this.sending || this.reconnecting) return;
     const text = this.draft.trim();
     const pending = this.attachments;
     if (text === "" && pending.length === 0) return;

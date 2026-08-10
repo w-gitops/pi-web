@@ -1,6 +1,6 @@
 import { LitElement, html } from "lit";
 import { customElement, query, state } from "lit/decorators.js";
-import { configApi, effectiveWorkspaceUploadFolder, sessionsApi, terminalsApi, workspacesApi, workspaceEffectiveUploadFolder, type AskUserSubmission, type ExtensionDialogAnswer, type Machine, type MachineHealth, type PiWebConfigValues, type PiWebShortcutConfig, type Project, type SessionCleanupExecuteResponse, type SessionCleanupPreviewResponse, type SessionCleanupRequest, type SessionInfo, type SessionTreeForkResult, type SessionTreeNavigateResult, type SessionTreeSummaryChoice, type TerminalCommandRun, type TerminalUiEvent, type Workspace } from "../api";
+import { configApi, effectiveWorkspaceUploadFolder, machinesApi, sessionsApi, terminalsApi, workspacesApi, workspaceEffectiveUploadFolder, type AskUserSubmission, type ExtensionDialogAnswer, type Machine, type MachineHealth, type PiWebConfigValues, type PiWebShortcutConfig, type Project, type SessionCleanupExecuteResponse, type SessionCleanupPreviewResponse, type SessionCleanupRequest, type SessionInfo, type SessionTreeForkResult, type SessionTreeNavigateResult, type SessionTreeSummaryChoice, type TerminalCommandRun, type TerminalUiEvent, type Workspace } from "../api";
 import type { AppAction } from "../actions";
 import { initialAppState, type AppState } from "../appState";
 import { isSessionActive } from "../../../shared/activity";
@@ -37,6 +37,7 @@ import { PluginRegistry, installPluginRuntimeScope, installWorkspacePanelScope }
 import { createWorkspaceFiles as createPluginWorkspaceFiles } from "../plugins/workspaceFiles";
 import { queryNamespace, readNamespacedString, setNamespacedQueryKey } from "../namespacedQueryArgs";
 import { AppShellController } from "../appShell/appShellController";
+import { BrowserConnectionRecovery } from "../appShell/browserConnectionRecovery";
 import { BrowserResumeController } from "../appShell/browserResumeController";
 import { NavigationSectionsController, type NavigationSection } from "../appShell/navigationState";
 import { PanelCollapseController, mainViewClass } from "../appShell/panelCollapseController";
@@ -208,10 +209,17 @@ export class PiWebApp extends LitElement {
   private readonly machineNavigation = new SessionStorageMachineNavigationMemory();
   private readonly terminalSelection = new SessionStorageTerminalSelectionMemory();
   private readonly appShell = new AppShellController(this);
+  private readonly browserConnectionRecovery = new BrowserConnectionRecovery({
+    reconnectTransports: () => { this.reconnectBrowserTransports(); },
+    probe: async () => (await machinesApi.health(selectedMachineId(this.state))).ok,
+    refresh: () => this.refreshAfterBrowserResume(),
+    onStateChange: (recovering) => { this.reconnectingAfterResume = recovering; },
+    onProbeError: () => undefined,
+  });
   private readonly browserResume = new BrowserResumeController({
     onResumeSignal: () => { this.handleBrowserResumeSignal(); },
-    onNetworkOnline: () => { this.reconnectBrowserTransports(); },
-    onStaleResume: () => { this.reconnectBrowserTransports(); },
+    onNetworkOnline: () => { this.browserConnectionRecovery.start(); },
+    onStaleResume: () => { this.browserConnectionRecovery.start(); },
     refreshAfterResume: () => this.refreshAfterBrowserResume(),
     onRefreshError: (error) => { console.warn("Failed to refresh after browser resume", error); },
   });
@@ -246,6 +254,7 @@ export class PiWebApp extends LitElement {
   private themePreference: ThemePreference = readStoredThemePreference() ?? DEFAULT_THEME_PREFERENCE;
   @state() private activeThemeId: QualifiedContributionId = CLASSIC_THEME_ID;
   @state() private isRefreshingApp = false;
+  @state() private reconnectingAfterResume = false;
   @state() private sessionCleanupDialog: SessionCleanupDialogState | undefined;
   @state() private settingsSection: SettingsSection | undefined = readSettingsSection();
   @state() private shortcutConfig: PiWebShortcutConfig = {};
@@ -381,6 +390,7 @@ export class PiWebApp extends LitElement {
     window.removeEventListener("popstate", this.onPopState);
     window.removeEventListener("pageshow", this.onPageShow);
     this.browserResume.disconnect();
+    this.browserConnectionRecovery.stop();
     window.removeEventListener("keydown", this.onKeyDown, GLOBAL_SHORTCUT_LISTENER_OPTIONS);
     this.systemLightThemeMedia?.removeEventListener("change", this.onSystemLightThemeChange);
     this.keyboard.reset();
@@ -447,6 +457,7 @@ export class PiWebApp extends LitElement {
   }
 
   private async refreshAfterBrowserResume(): Promise<void> {
+    if (this.browserConnectionRecovery.isRecovering()) return;
     await this.sessionUnread.refreshAll();
     await Promise.all([
       this.sessions.refreshSelectedSession(),
@@ -2138,7 +2149,7 @@ export class PiWebApp extends LitElement {
           <div class="mobile-navigation-panel">${this.appShell.isMobileNavigationLayout ? this.renderNavigationPanel() : null}</div>
           ${state.selectedSession ? html`
             ${this.renderChatView(state, state.selectedSession)}
-            <prompt-editor .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .disabled=${state.selectedSession.archived === true} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
+            <prompt-editor .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .disabled=${state.selectedSession.archived === true} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .reconnecting=${this.reconnectingAfterResume} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
             ${this.renderStatusBar(state)}
             ${state.commandDialog !== undefined ? html`<command-picker .title=${state.commandDialog.title} .options=${state.commandDialog.options} .onPick=${(value: string) => this.sessions.respondToCommand(state.commandDialog?.requestId ?? "", value)} .onCancel=${() => { this.sessions.cancelCommand(); }}></command-picker>` : null}
             ${state.modelDialog !== undefined ? html`<command-picker title=${state.modelDialog.title} .searchable=${true} .options=${state.modelDialog.options} .selectedValue=${state.modelDialog.selectedValue} .onPick=${(value: string) => { void this.pickModel(value); }} .onCancel=${() => { this.setState({ modelDialog: undefined }); }}></command-picker>` : null}
