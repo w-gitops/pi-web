@@ -401,6 +401,37 @@ test("continuous auto playback starts successor synthesis before prior audio end
   assert.equal(player.activeRun, undefined);
 });
 
+test("a following turn reopens Auto-Read while prior audio is still playing", async () => {
+  const calls = [];
+  const audio = fakeAudioContext();
+  const { player } = makePlayer({
+    audio,
+    fetch: async (_url, options) => {
+      calls.push(JSON.parse(options.body).input);
+      return streamResponse([audioRecord(0), { type: "done", chunks: 1 }]);
+    },
+  });
+  await player.primeForAutoplay();
+  const run = await player.startAuto({ messageId: "first", button: {} });
+  player.enqueueAuto(run, "First turn.");
+  player.finishAuto(run);
+  for (let index = 0; index < 20 && audio.sources.length < 1; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(player.reopenAuto(run), true);
+  audio.sources[0].onended();
+  await new Promise((resolve) => setImmediate(resolve));
+  player.enqueueAuto(run, "Second turn.");
+  player.finishAuto(run);
+  for (let index = 0; index < 20 && audio.sources.length < 2; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(calls, ["First turn.", "Second turn."]);
+  assert.equal(audio.sources[0].stopped, undefined);
+  audio.sources[0].onended?.();
+  audio.sources[1].onended();
+});
+
 test("auto-read baselines history, emits each sentence once, and flushes the final tail", async () => {
   const enqueued = [];
   let finished = 0;
@@ -448,6 +479,29 @@ test("auto-read falls back to a newly completed turn when live status was missed
   });
   assert.deepEqual(enqueued, ["A fast response completed before the live poll."]);
   assert.equal(finishes, 1);
+});
+
+test("controller queues a second completed turn onto an active auto run", async () => {
+  const enqueued = [];
+  let reopens = 0;
+  const run = { mode: "auto", queueChars: 0 };
+  const player = {
+    activeRun: undefined, primeForAutoplay: async () => {},
+    startAuto: async () => { player.activeRun = run; return run; },
+    reopenAuto: () => { reopens += 1; return true; },
+    enqueueAuto: (_run, text) => { enqueued.push(text); return true; },
+    finishAuto: () => {}, stop: () => {},
+  };
+  const controller = new AutoReadController(player, { telemetry: () => {} });
+  const snapshot = (turnId, messageId, text) => ({
+    available: true, hidden: false, sessionId: "s", turnId, messageId,
+    text, isStreaming: false, button: {},
+  });
+  await controller.enable(snapshot("old", "data-index:1", "Old."));
+  await controller.poll(snapshot("first", "data-index:3", "First response."));
+  await controller.poll(snapshot("second", "data-index:5", "Second response."));
+  assert.deepEqual(enqueued, ["First response.", "Second response."]);
+  assert.equal(reopens, 1);
 });
 
 test("auto-read fails closed on revisions, navigation, and queue backpressure", async () => {

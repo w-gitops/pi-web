@@ -679,6 +679,7 @@ export class ChatterboxPlayer {
       source: undefined, sources: new Set(), settlements: new Set(), reader: undefined, cancelled: false,
       requestId: newRequestId(), startedAt: this.now(), telemetrySent: false,
       mode: "manual", queue: [], queueChars: 0, final: false, wake: undefined, scheduled: undefined,
+      reopenEpoch: 0,
     });
     this.activeRun = run;
     this.emit(run, "loading", { chunkIndex: 0 });
@@ -824,6 +825,7 @@ export class ChatterboxPlayer {
       source: undefined, sources: new Set(), settlements: new Set(), reader: undefined, cancelled: false,
       requestId: newRequestId(), startedAt: this.now(), telemetrySent: false,
       mode: "auto", queue: [], queueChars: 0, final: false, wake: undefined, scheduled: undefined,
+      reopenEpoch: 0,
     });
     this.activeRun = run;
     this.emit(run, "loading", { chunkIndex: 0 });
@@ -841,6 +843,15 @@ export class ChatterboxPlayer {
       run.queue[last] = `${run.queue[last]} ${text}`;
     } else run.queue.push(text);
     run.queueChars += separatorChars + text.length;
+    run.wake?.();
+    run.wake = undefined;
+    return true;
+  }
+
+  reopenAuto(run) {
+    if (!this.isActive(run) || run.mode !== "auto") return false;
+    run.reopenEpoch += 1;
+    run.final = false;
     run.wake?.();
     run.wake = undefined;
     return true;
@@ -870,8 +881,25 @@ export class ChatterboxPlayer {
           continue;
         }
         if (run.final) {
-          await run.scheduled?.ended;
-          if (!this.isActive(run)) return;
+          if (run.scheduled) {
+            const scheduled = run.scheduled;
+            const epoch = run.reopenEpoch;
+            let wake;
+            const reopened = new Promise((resolve) => {
+              wake = () => resolve("reopened");
+              run.wake = wake;
+            });
+            const outcome = await Promise.race([
+              scheduled.ended.then(() => "ended"), reopened,
+            ]);
+            if (run.wake === wake) run.wake = undefined;
+            if (!this.isActive(run)) return;
+            if (outcome === "reopened"
+              || epoch !== run.reopenEpoch
+              || scheduled !== run.scheduled
+              || !run.final
+              || run.queue.length) continue;
+          }
           this.recordRun(run, "success", 200);
           this.activeRun = undefined;
           this.onState({ run, state: "idle" });
@@ -1199,7 +1227,8 @@ export class AutoReadController {
         if (!snapshot.isStreaming) this.baseline(snapshot);
         return;
       }
-      if (this.player.activeRun) {
+      const active = this.player.activeRun;
+      if (active && active.mode !== "auto") {
         this.telemetry?.({ outcome: "auto.busy" });
         this.baselineTurnId = snapshot.turnId;
         return;
@@ -1209,20 +1238,27 @@ export class AutoReadController {
       this.messageId = snapshot.messageId;
       this.lastRaw = "";
       this.committedSpeech = "";
-      try {
-        this.run = await this.player.startAuto({
-          messageId: snapshot.messageId, button: snapshot.button,
-        });
-      } catch (error) {
-        if (generation === this.generation) {
-          this.telemetry?.({ outcome: "auto.blocked" });
-          this.enabled = false;
-          this.onNotice("Auto-Read needs a tap on Enable / Resume before it can play audio.");
-          this.cancel(true);
+      if (active && this.player.reopenAuto(active)) {
+        this.run = active;
+        active.messageId = snapshot.messageId;
+        active.button = snapshot.button;
+        this.telemetry?.({ outcome: "auto.turn_queued" });
+      } else {
+        try {
+          this.run = await this.player.startAuto({
+            messageId: snapshot.messageId, button: snapshot.button,
+          });
+        } catch (error) {
+          if (generation === this.generation) {
+            this.telemetry?.({ outcome: "auto.blocked" });
+            this.enabled = false;
+            this.onNotice("Auto-Read needs a tap on Enable / Resume before it can play audio.");
+            this.cancel(true);
+          }
+          return;
         }
-        return;
+        if (generation !== this.generation) return;
       }
-      if (generation !== this.generation) return;
     }
     if (snapshot.turnId !== this.turnId) {
       if (!this.enqueueSnapshot(this.lastRaw, true)) return;
