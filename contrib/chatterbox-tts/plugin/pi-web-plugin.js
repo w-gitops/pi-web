@@ -1125,6 +1125,11 @@ export class AutoReadController {
     this.committedSpeech = "";
     this.run = undefined;
     this.suppressedTurnId = undefined;
+    this.waitingForManual = false;
+    this.resumingDeferred = undefined;
+    this.deferredSegments = [];
+    this.deferredChars = 0;
+    this.deferredFinal = false;
   }
 
   baseline(snapshot) {
@@ -1156,12 +1161,30 @@ export class AutoReadController {
   cancel(suppress = true) {
     this.generation += 1;
     if (suppress && this.turnId) this.suppressedTurnId = this.turnId;
-    this.player.stop();
+    if (!this.waitingForManual) this.player.stop();
     this.turnId = undefined;
     this.messageId = undefined;
     this.run = undefined;
     this.lastRaw = "";
     this.committedSpeech = "";
+    this.waitingForManual = false;
+    this.resumingDeferred = undefined;
+    this.deferredSegments = [];
+    this.deferredChars = 0;
+    this.deferredFinal = false;
+  }
+
+  deferSegment(speech) {
+    const text = typeof speech === "string" ? speech.trim() : "";
+    if (!text) return true;
+    const separatorChars = this.deferredSegments.length >= MAX_AUTO_QUEUE_SEGMENTS ? 1 : 0;
+    if (this.deferredChars + separatorChars + text.length > MAX_AUTO_QUEUE_CHARS) return false;
+    if (this.deferredSegments.length >= MAX_AUTO_QUEUE_SEGMENTS) {
+      const last = this.deferredSegments.length - 1;
+      this.deferredSegments[last] = `${this.deferredSegments[last]} ${text}`;
+    } else this.deferredSegments.push(text);
+    this.deferredChars += separatorChars + text.length;
+    return true;
   }
 
   suppressCurrent() { this.cancel(true); }
@@ -1185,16 +1208,26 @@ export class AutoReadController {
     }
     const delta = speech.slice(this.committedSpeech.length).trim();
     if (delta) {
-      if (!this.player.enqueueAuto(this.run, delta)) {
-        this.telemetry?.({ outcome: "auto.backpressure", queueChars: this.run?.queueChars ?? 0 });
+      const accepted = this.waitingForManual
+        ? this.deferSegment(delta)
+        : this.player.enqueueAuto(this.run, delta);
+      if (!accepted) {
+        this.telemetry?.({
+          outcome: "auto.backpressure",
+          queueChars: this.waitingForManual ? this.deferredChars : (this.run?.queueChars ?? 0),
+        });
         this.onNotice("Auto-Read paused because speech fell behind the response.");
         this.suppressedTurnId = this.turnId;
-        this.player.finishAuto(this.run);
+        if (!this.waitingForManual) this.player.finishAuto(this.run);
         this.turnId = undefined;
         this.messageId = undefined;
         this.run = undefined;
         this.lastRaw = "";
         this.committedSpeech = "";
+        this.waitingForManual = false;
+        this.deferredSegments = [];
+        this.deferredChars = 0;
+        this.deferredFinal = false;
         return false;
       }
       this.telemetry?.({ outcome: "auto.segment", inputChars: delta.length });
@@ -1226,6 +1259,55 @@ export class AutoReadController {
         return;
       } else return;
     }
+    if (this.resumingDeferred !== undefined) return;
+    if (this.waitingForManual && !this.player.activeRun) {
+      const generation = ++this.generation;
+      this.waitingForManual = false;
+      this.resumingDeferred = generation;
+      let resumedRun;
+      try {
+        resumedRun = await this.player.startAuto({
+          messageId: this.messageId, button: snapshot.button,
+        });
+      } catch (error) {
+        if (this.resumingDeferred === generation) this.resumingDeferred = undefined;
+        if (generation === this.generation) {
+          this.enabled = false;
+          this.onNotice("Auto-Read needs a tap on Enable / Resume before it can play audio.");
+          this.cancel(true);
+        }
+        return;
+      }
+      if (this.resumingDeferred === generation) this.resumingDeferred = undefined;
+      if (generation !== this.generation) {
+        if (this.player.activeRun === resumedRun) this.player.stop();
+        return;
+      }
+      this.run = resumedRun;
+      const segments = this.deferredSegments;
+      const final = this.deferredFinal;
+      this.deferredSegments = [];
+      this.deferredChars = 0;
+      this.deferredFinal = false;
+      for (const segment of segments) {
+        if (!this.player.enqueueAuto(this.run, segment)) {
+          this.onNotice("Auto-Read paused because speech fell behind the response.");
+          this.cancel(true);
+          return;
+        }
+      }
+      this.telemetry?.({ outcome: "auto.manual_resumed", segmentCount: segments.length });
+      if (final) {
+        this.player.finishAuto(this.run);
+        this.baselineTurnId = this.turnId;
+        this.turnId = undefined;
+        this.messageId = undefined;
+        this.run = undefined;
+        this.lastRaw = "";
+        this.committedSpeech = "";
+        return;
+      }
+    }
     if (!this.turnId) {
       if (!snapshot.turnId || !snapshot.messageId || snapshot.turnId === this.baselineTurnId) {
         if (!snapshot.isStreaming) this.baseline(snapshot);
@@ -1233,16 +1315,21 @@ export class AutoReadController {
       }
       const active = this.player.activeRun;
       if (active && active.mode !== "auto") {
-        this.telemetry?.({ outcome: "auto.busy" });
-        this.baselineTurnId = snapshot.turnId;
-        return;
+        this.telemetry?.({ outcome: "auto.deferred_for_manual" });
+        this.turnId = snapshot.turnId;
+        this.messageId = snapshot.messageId;
+        this.lastRaw = "";
+        this.committedSpeech = "";
+        this.waitingForManual = true;
       }
       const generation = ++this.generation;
       this.turnId = snapshot.turnId;
       this.messageId = snapshot.messageId;
       this.lastRaw = "";
       this.committedSpeech = "";
-      if (active && this.player.reopenAuto(active)) {
+      if (this.waitingForManual) {
+        this.run = undefined;
+      } else if (active && this.player.reopenAuto(active)) {
         this.run = active;
         active.messageId = snapshot.messageId;
         active.button = snapshot.button;
@@ -1292,6 +1379,11 @@ export class AutoReadController {
     if (!snapshot.messageId || snapshot.messageId !== this.messageId) return;
     if (!this.enqueueSnapshot(snapshot.text, !snapshot.isStreaming)) return;
     if (!snapshot.isStreaming) {
+      if (this.waitingForManual) {
+        this.deferredFinal = true;
+        this.baselineTurnId = this.turnId;
+        return;
+      }
       this.player.finishAuto(this.run);
       this.baselineTurnId = this.turnId;
       this.turnId = undefined;

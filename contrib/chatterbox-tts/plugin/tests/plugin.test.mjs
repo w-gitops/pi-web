@@ -504,6 +504,74 @@ test("controller queues a second completed turn onto an active auto run", async 
   assert.equal(reopens, 1);
 });
 
+test("Auto-Read defers a completed response until manual playback finishes", async () => {
+  const enqueued = [];
+  let starts = 0;
+  let finishes = 0;
+  const manual = { mode: "manual" };
+  const auto = { mode: "auto", queueChars: 0 };
+  const player = {
+    activeRun: manual, primeForAutoplay: async () => {},
+    startAuto: async () => { starts += 1; player.activeRun = auto; return auto; },
+    reopenAuto: () => true,
+    enqueueAuto: (_run, text) => { enqueued.push(text); return true; },
+    finishAuto: () => { finishes += 1; }, stop: () => {},
+  };
+  const controller = new AutoReadController(player, { telemetry: () => {} });
+  const snapshot = (turnId, messageId, text, isStreaming = false) => ({
+    available: true, hidden: false, sessionId: "s", turnId, messageId,
+    text, isStreaming, button: {},
+  });
+  await controller.enable(snapshot("old", "data-index:1", "Old."));
+  const completed = snapshot("next", "data-index:3", "Read me after the manual passage.");
+  await controller.poll(completed);
+  assert.equal(starts, 0);
+  assert.deepEqual(enqueued, []);
+  assert.equal(controller.waitingForManual, true);
+  player.activeRun = undefined;
+  await controller.poll(completed);
+  assert.equal(starts, 1);
+  assert.deepEqual(enqueued, ["Read me after the manual passage."]);
+  assert.equal(finishes, 1);
+});
+
+test("deferred resume is single-flight and cancellation cannot orphan its run", async () => {
+  let releaseStart;
+  const startGate = new Promise((resolve) => { releaseStart = resolve; });
+  let starts = 0;
+  let stops = 0;
+  const manual = { mode: "manual" };
+  const auto = { mode: "auto", queueChars: 0 };
+  const player = {
+    activeRun: manual, primeForAutoplay: async () => {},
+    startAuto: async () => {
+      starts += 1;
+      player.activeRun = auto;
+      await startGate;
+      return auto;
+    },
+    reopenAuto: () => true, enqueueAuto: () => true, finishAuto: () => {},
+    stop: () => { stops += 1; player.activeRun = undefined; },
+  };
+  const controller = new AutoReadController(player, { telemetry: () => {} });
+  const completed = {
+    available: true, hidden: false, sessionId: "s", turnId: "next",
+    messageId: "data-index:3", text: "Deferred response.", isStreaming: false, button: {},
+  };
+  await controller.enable({ ...completed, turnId: "old", messageId: "data-index:1" });
+  await controller.poll(completed);
+  player.activeRun = undefined;
+  const firstPoll = controller.poll(completed);
+  await new Promise((resolve) => setImmediate(resolve));
+  await controller.poll(completed);
+  assert.equal(starts, 1);
+  controller.cancel(false);
+  releaseStart();
+  await firstPoll;
+  assert.equal(stops, 1);
+  assert.equal(player.activeRun, undefined);
+});
+
 test("steered turns remain on the active Auto-Read run without a streaming gap", async () => {
   const enqueued = [];
   let starts = 0;
