@@ -578,7 +578,7 @@ test("private DOM adapter remains narrow and package export follows PI WEB v1", 
   root.host = view;
   assert.deepEqual(inspectAutoReadView(root, { visibilityState: "visible" }), {
     available: true, view, sessionId: "s", isStreaming: true, hidden: false,
-    turnId: "s:response:data-index:6", messageId: "s:assistant:data-index:7",
+    turnId: "s:response:data-index:6", messageId: "data-index:7",
     message, button: undefined, text: "Streaming.",
   });
   assert.equal(inspectAutoReadView({ host: { isConnected: false } }).available, false);

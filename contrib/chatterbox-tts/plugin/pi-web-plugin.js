@@ -1062,7 +1062,9 @@ export function inspectAutoReadView(root, documentObject = globalThis.document) 
     isStreaming: view.status.isStreaming,
     hidden: documentObject?.visibilityState === "hidden",
     turnId: responseIdentity ? `${view.sessionId}:response:${responseIdentity}` : undefined,
-    messageId: messageIdentity ? `${view.sessionId}:assistant:${messageIdentity}` : undefined,
+    // Keep this identical to the button's DOM identity so reconciliation can
+    // transfer an active Auto-Read run when Lit replaces the message element.
+    messageId: messageIdentity,
     message,
     button,
     text: message ? extractAssistantText(message) : "",
