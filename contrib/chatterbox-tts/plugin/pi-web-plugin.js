@@ -1055,11 +1055,15 @@ export function inspectAutoReadView(root, documentObject = globalThis.document) 
     ? deriveMessageIdentity(latestUser, users.length - 1)
     : messageIdentity;
   const button = message?.querySelector?.(`[${DOM_CONTRACT.buttonMarker}]`);
+  const responseLive = view.status.isStreaming
+    || view.isSendingPrompt === true
+    || view.status.isBashRunning === true
+    || view.activity?.phase === "active";
   return {
     available: true,
     view,
     sessionId: view.sessionId,
-    isStreaming: view.status.isStreaming,
+    isStreaming: responseLive,
     hidden: documentObject?.visibilityState === "hidden",
     turnId: responseIdentity ? `${view.sessionId}:response:${responseIdentity}` : undefined,
     // Keep this identical to the button's DOM identity so reconciliation can
@@ -1180,14 +1184,18 @@ export class AutoReadController {
       return;
     }
     if (this.suppressedTurnId) {
-      if (!snapshot.isStreaming || (snapshot.turnId && snapshot.turnId !== this.suppressedTurnId)) {
+      const nextTurn = snapshot.turnId && snapshot.turnId !== this.suppressedTurnId;
+      if (nextTurn) {
         this.baselineTurnId = this.suppressedTurnId;
         this.suppressedTurnId = undefined;
-        if (!snapshot.isStreaming) { this.baseline(snapshot); return; }
+      } else if (!snapshot.isStreaming) {
+        this.suppressedTurnId = undefined;
+        this.baseline(snapshot);
+        return;
       } else return;
     }
     if (!this.turnId) {
-      if (!snapshot.isStreaming || !snapshot.turnId || !snapshot.messageId || snapshot.turnId === this.baselineTurnId) {
+      if (!snapshot.turnId || !snapshot.messageId || snapshot.turnId === this.baselineTurnId) {
         if (!snapshot.isStreaming) this.baseline(snapshot);
         return;
       }

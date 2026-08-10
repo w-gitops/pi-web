@@ -427,6 +427,29 @@ test("auto-read baselines history, emits each sentence once, and flushes the fin
   assert.equal(finished, 1);
 });
 
+test("auto-read falls back to a newly completed turn when live status was missed", async () => {
+  const enqueued = [];
+  let finishes = 0;
+  const player = {
+    activeRun: undefined, primeForAutoplay: async () => {},
+    startAuto: async () => ({ queueChars: 0 }),
+    enqueueAuto: (_run, text) => { enqueued.push(text); return true; },
+    finishAuto: () => { finishes += 1; }, stop: () => {},
+  };
+  const controller = new AutoReadController(player, { telemetry: () => {} });
+  const old = {
+    available: true, hidden: false, sessionId: "s", turnId: "old", messageId: "data-index:1",
+    text: "Old.", isStreaming: false, button: {},
+  };
+  await controller.enable(old);
+  await controller.poll({
+    ...old, turnId: "new", messageId: "data-index:3",
+    text: "A fast response completed before the live poll.",
+  });
+  assert.deepEqual(enqueued, ["A fast response completed before the live poll."]);
+  assert.equal(finishes, 1);
+});
+
 test("auto-read fails closed on revisions, navigation, and queue backpressure", async () => {
   let stops = 0;
   let finishes = 0;
@@ -574,7 +597,10 @@ test("private DOM adapter remains narrow and package export follows PI WEB v1", 
   const root = {
     querySelectorAll: (selector) => selector === DOM_CONTRACT.userSelector ? [user] : [message],
   };
-  const view = { shadowRoot: root, isConnected: true, sessionId: "s", status: { isStreaming: true } };
+  const view = {
+    shadowRoot: root, isConnected: true, sessionId: "s",
+    status: { isStreaming: false, isBashRunning: false }, activity: { phase: "active" },
+  };
   root.host = view;
   assert.deepEqual(inspectAutoReadView(root, { visibilityState: "visible" }), {
     available: true, view, sessionId: "s", isStreaming: true, hidden: false,
