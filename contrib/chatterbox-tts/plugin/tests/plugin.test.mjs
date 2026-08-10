@@ -97,7 +97,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function fakeAudioContext({ autoEnd = false } = {}) {
+function fakeAudioContext({ autoEnd = false, keepalive = false } = {}) {
   const sources = [];
   const decoded = [];
   const context = {
@@ -105,6 +105,7 @@ function fakeAudioContext({ autoEnd = false } = {}) {
     resume: async () => { context.state = "running"; },
     close: async () => { context.state = "closed"; },
     decodeAudioData: async (bytes) => { const value = { bytes: new Uint8Array(bytes), duration: 1 }; decoded.push(value); return value; },
+    ...(keepalive ? { sampleRate: 24_000, createBuffer: () => ({ duration: 1 }) } : {}),
     createBufferSource: () => {
       const source = {
         connect() {}, disconnect() { source.disconnected = true; },
@@ -346,6 +347,30 @@ test("rapid run replacement keeps immutable ownership and stale suppression", as
   assert.equal((await oldRun).status, "stale");
   const newStart = states.findIndex((state) => state.run.messageId === "new");
   assert.ok(states.slice(newStart).every((state) => state.run.messageId === "new"));
+});
+
+test("autoplay keeps an unlocked mobile audio context alive until disabled", async () => {
+  const audio = fakeAudioContext({ keepalive: true });
+  const { player } = makePlayer({ audio });
+  await player.primeForAutoplay();
+  await player.primeForAutoplay();
+  assert.equal(audio.sources.length, 1, "repeated gestures reuse one keepalive source");
+  assert.equal(audio.sources[0].loop, true);
+  assert.equal(player.autoplayKeepalive, audio.sources[0]);
+  player.releaseAutoplay();
+  assert.equal(audio.sources[0].stopped, true);
+  assert.equal(audio.sources[0].disconnected, true);
+
+  const replacement = fakeAudioContext({ keepalive: true });
+  const contexts = [audio.context, replacement.context];
+  let contextIndex = 0;
+  const replacing = new ChatterboxPlayer({ createAudioContext: () => contexts[contextIndex++] });
+  await replacing.primeForAutoplay();
+  await contexts[0].close();
+  await replacing.primeForAutoplay();
+  assert.equal(audio.sources[1].stopped, true, "a stale keepalive is released with its closed context");
+  assert.equal(replacing.context, replacement.context);
+  assert.equal(replacing.autoplayKeepalive, replacement.sources[0]);
 });
 
 test("continuous auto playback starts successor synthesis before prior audio ends", async () => {

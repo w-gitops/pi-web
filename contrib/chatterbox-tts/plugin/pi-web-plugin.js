@@ -589,6 +589,7 @@ export class ChatterboxPlayer {
     this.onState = dependencies.onState ?? (() => {});
     this.telemetry = dependencies.telemetry ?? recordClientTelemetry;
     this.context = undefined;
+    this.autoplayKeepalive = undefined;
     this.activeRun = undefined;
     this.nextRunId = 0;
   }
@@ -601,22 +602,38 @@ export class ChatterboxPlayer {
   }
 
   async prime(run) {
-    if (!this.context || this.context.state === "closed") this.context = this.createAudioContext();
+    if (!this.context || this.context.state === "closed") {
+      this.releaseAutoplay();
+      this.context = this.createAudioContext();
+    }
     await this.context.resume?.();
     if (!this.isActive(run)) throw errorWithCode("Playback was cancelled.", "stale");
   }
 
   async primeForAutoplay() {
-    if (!this.context || this.context.state === "closed") this.context = this.createAudioContext();
+    if (!this.context || this.context.state === "closed") {
+      this.releaseAutoplay();
+      this.context = this.createAudioContext();
+    }
     await this.context.resume?.();
     if (this.context.state !== "running") throw errorWithCode("Tap Enable Auto-Read again to unlock audio.", "autoplay");
-    if (this.context.createBuffer) {
+    if (!this.autoplayKeepalive && this.context.createBuffer) {
       const source = this.context.createBufferSource();
-      source.buffer = this.context.createBuffer(1, 1, this.context.sampleRate || 24_000);
+      source.buffer = this.context.createBuffer(1, this.context.sampleRate || 24_000, this.context.sampleRate || 24_000);
+      source.buffer.getChannelData?.(0).fill(1e-7);
+      source.loop = true;
       source.connect(this.context.destination);
       source.start(0);
-      source.disconnect?.();
+      this.autoplayKeepalive = source;
     }
+  }
+
+  releaseAutoplay() {
+    const source = this.autoplayKeepalive;
+    this.autoplayKeepalive = undefined;
+    if (!source) return;
+    try { source.stop(); } catch { /* already ended */ }
+    try { source.disconnect(); } catch { /* already disconnected */ }
   }
 
   recordRun(run, outcome, status) {
@@ -968,6 +985,7 @@ export class ChatterboxPlayer {
 
   async dispose() {
     this.stop();
+    this.releaseAutoplay();
     if (this.context && this.context.state !== "closed") await this.context.close?.();
     this.context = undefined;
   }
@@ -1307,7 +1325,10 @@ function createBrowserRuntime() {
         if (!window.confirm(`Auto-Read will automatically send new assistant prose to:\n${destination}\n\nEnable it for this browser?`)) return;
       }
       if (!await autoRead.enable(autoSnapshot())) return;
-    } else autoRead.disable(autoSnapshot());
+    } else {
+      autoRead.disable(autoSnapshot());
+      player.releaseAutoplay();
+    }
     saveSettings({ ...current, autoRead: enabled });
     announce(enabled ? "Auto-Read enabled" : "Auto-Read disabled");
   };
@@ -1383,7 +1404,8 @@ function createBrowserRuntime() {
   window.setTimeout(() => void reloadForPluginUpdate(player), 5_000);
   let unlockPromise;
   const unlockPersistedAutoRead = () => {
-    if (!loadSettings().autoRead || autoRead.enabled || unlockPromise) return;
+    const needsUnlock = player.context?.state !== "running" || !player.autoplayKeepalive;
+    if (!loadSettings().autoRead || (autoRead.enabled && !needsUnlock) || unlockPromise) return;
     unlockPromise = autoRead.enable(autoSnapshot())
       .catch((error) => console.warn("Chatterbox Auto-Read audio unlock failed", error))
       .finally(() => { unlockPromise = undefined; });
