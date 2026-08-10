@@ -53,9 +53,28 @@ OTEL_SERVICE_NAME=voice-tts-chatterbox \
 python server/chatterbox-service.py
 ```
 
-`server/chatterbox.service.example` shows a systemd unit. Chatterbox voice conditionals are mutable, so a process-local lock serializes warmup, legacy requests, and streamed chunks. Multiple workers sharing one model are unsupported. Cancelling a request stops future chunks but cannot interrupt a `model.generate()` call already executing; a replacement request may briefly wait for that active GPU chunk.
+`server/chatterbox.service.example` shows a standard-model systemd unit. Chatterbox voice conditionals are mutable, so a process-local lock serializes warmup, legacy requests, and streamed chunks. Multiple workers sharing one model are unsupported. Cancelling a request stops future chunks but cannot interrupt a `model.generate()` call already executing; a replacement request may briefly wait for that active GPU chunk.
 
-The service defaults to Chatterbox's 10 CFM steps and uniform 160-character chunks. The example above is a measured Quadro P2200 startup profile: seven CFM steps, a 160-character playback-buffer chunk, an 80-character successor, then 120-character steady-state chunks. Treat these as deployment tuning rather than universal defaults, and verify voice quality and successor readiness on the target model and GPU.
+The service defaults to Chatterbox's 10 CFM steps and uniform 160-character chunks. The example above is a measured Quadro P2200 standard-model profile: seven CFM steps, a 160-character playback-buffer chunk, an 80-character successor, then 120-character steady-state chunks. Treat these as deployment tuning rather than universal defaults, and verify voice quality and successor readiness on the target model and GPU.
+
+### Chatterbox Turbo
+
+Set `CHATTERBOX_MODEL=turbo` to load `ChatterboxTurboTTS`. Install `server/requirements-turbo.txt`, which pins the tested upstream revision because Turbo support postdates the 0.1.7 PyPI release. Turbo's distilled decoder is fixed at two CFM steps, so the service requires `CHATTERBOX_CFM_STEPS=2`. `server/chatterbox-turbo.service.example` contains the measured deployment profile and requires a successful production-voice warmup before Flask begins listening:
+
+```sh
+CHATTERBOX_MODEL=turbo \
+CHATTERBOX_CFM_STEPS=2 \
+CHATTERBOX_FIRST_CHUNK_CHARS=120 \
+CHATTERBOX_SECOND_CHUNK_CHARS=80 \
+CHATTERBOX_LATER_CHUNK_CHARS=120 \
+python server/chatterbox-service.py
+```
+
+On a 5 GB Quadro P2200, the resident Turbo model peaked below 3 GB of CUDA allocations and generated 6.44 seconds of custom-voice audio from 120 characters in 2.75 seconds (RTF 0.426). Keep T3 and S3Gen resident: CPU offloading added roughly one second per chunk and was unnecessary after the NVIDIA runtime was configured correctly.
+
+For an NVIDIA GPU passed into an LXC, exposing `/dev/nvidia*` and `libcuda` may not be sufficient. CUDA FFT kernels on the tested Pascal GPU failed with `CUFFT_INTERNAL_ERROR` until the container could resolve the host-driver-matched `libnvidia-ptxjitcompiler.so.1` and `libnvidia-nvvm.so.4`. The tested Proxmox host stores versioned libraries under `/usr/lib/x86_64-linux-gnu/nvidia/current/`; mount that directory read-only, create only the standard soname links to files from the same driver version, and run `ldconfig`. Compare `nvidia-smi` driver versions and library checksums after host driver upgrades rather than linking arbitrary container packages.
+
+Set `CHATTERBOX_WARMUP_VOICE` to the same named voice used by clients (`alloy` in the example). Required warmup fails startup if that file is missing or generation fails. Before proxy cutover, run `python server/verify-turbo.py --base-url http://127.0.0.1:9004 --voice alloy` inside the LXC. It executes CUDA `torch.stft`, verifies warmed Turbo health, and validates production-voice NDJSON/PCM16 streaming. Standard and Turbo cannot remain resident together on the tested 5 GB GPU. Stop the active service before starting the other and preserve the previous upstream as the immediate rollback. This creates a short planned outage while the replacement loads and warms; if startup or smoke verification fails, stop Turbo and restart standard without changing the proxy.
 
 ## HTTPS reverse proxy
 

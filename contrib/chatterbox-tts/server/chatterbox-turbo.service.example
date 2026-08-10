@@ -1,0 +1,34 @@
+[Unit]
+Description=Chatterbox Turbo TTS Service (OpenAI-compatible)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt
+Environment="PORT=9004"
+Environment="CHATTERBOX_DEVICE=cuda"
+Environment="CHATTERBOX_MODEL=turbo"
+# Do not listen or pass /health unless production-voice generation succeeds.
+Environment="CHATTERBOX_REQUIRE_SUCCESSFUL_WARMUP=true"
+Environment="CHATTERBOX_WARMUP_VOICE=alloy"
+Environment="VOICES_DIR=/opt/chatterbox-voices"
+# Turbo's distilled decoder always uses two CFM steps.
+Environment="CHATTERBOX_CFM_STEPS=2"
+# Measured safe profile on a Quadro P2200: about 2.75s to 6.44s of first audio.
+Environment="CHATTERBOX_FIRST_CHUNK_CHARS=120"
+Environment="CHATTERBOX_SECOND_CHUNK_CHARS=80"
+Environment="CHATTERBOX_LATER_CHUNK_CHARS=120"
+Environment="HF_HOME=/opt/huggingface"
+Environment="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+Environment="OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.internal:4317"
+Environment="OTEL_EXPORTER_OTLP_PROTOCOL=grpc"
+Environment="OTEL_SERVICE_NAME=voice-tts-chatterbox-turbo"
+Environment="DEPLOYMENT_ENVIRONMENT=production"
+Environment="LOG_LEVEL=INFO"
+ExecStart=/opt/chatterbox-turbo-env/bin/python /opt/chatterbox-service.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

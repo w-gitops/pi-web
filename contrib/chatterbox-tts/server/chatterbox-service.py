@@ -25,10 +25,24 @@ from flask_cors import CORS  # noqa: E402
 log = logging.getLogger("voice.tts")
 tracer = get_tracer("voice.tts")
 
-MODEL_VARIANT = os.getenv("CHATTERBOX_MODEL", "default")
+def _resolve_model_variant(value: str) -> tuple[str, str]:
+    variant = value.strip().lower()
+    if variant in {"default", "chatterbox"}:
+        return "default", "chatterbox"
+    if variant in {"turbo", "chatterbox-turbo"}:
+        return "turbo", "chatterbox-turbo"
+    raise ValueError("CHATTERBOX_MODEL must be default, chatterbox, turbo, or chatterbox-turbo")
+
+
+MODEL_VARIANT, MODEL_NAME = _resolve_model_variant(os.getenv("CHATTERBOX_MODEL", "default"))
 DEVICE = os.getenv("CHATTERBOX_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 PORT = int(os.getenv("PORT", "9004"))
 VOICES_DIR = os.getenv("VOICES_DIR", "/opt/chatterbox-voices")
+REQUIRE_SUCCESSFUL_WARMUP = os.getenv(
+    "CHATTERBOX_REQUIRE_SUCCESSFUL_WARMUP",
+    "true" if MODEL_VARIANT == "turbo" else "false",
+).strip().lower() in {"1", "true", "yes", "on"}
+WARMUP_VOICE = os.getenv("CHATTERBOX_WARMUP_VOICE", "alloy").strip()
 
 STREAM_PROTOCOL_VERSION = "1"
 FIRST_CHUNK_CHARS = int(os.getenv("CHATTERBOX_FIRST_CHUNK_CHARS", "160"))
@@ -44,9 +58,16 @@ MAX_INPUT_CHARS = 20_000
 MAX_STREAM_CHUNKS = 128
 MAX_VOICE_CHARS = 128
 MAX_MODEL_CHARS = 128
-CFM_STEPS = int(os.getenv("CHATTERBOX_CFM_STEPS", "10"))
-if not 1 <= CFM_STEPS <= 50:
-    raise ValueError("CHATTERBOX_CFM_STEPS must be between 1 and 50")
+def _resolve_cfm_steps(variant: str, value: str | None) -> int:
+    steps = int(value if value is not None else ("2" if variant == "turbo" else "10"))
+    if not 1 <= steps <= 50:
+        raise ValueError("CHATTERBOX_CFM_STEPS must be between 1 and 50")
+    if variant == "turbo" and steps != 2:
+        raise ValueError("Chatterbox Turbo has a fixed two-step decoder; set CHATTERBOX_CFM_STEPS=2")
+    return steps
+
+
+CFM_STEPS = _resolve_cfm_steps(MODEL_VARIANT, os.getenv("CHATTERBOX_CFM_STEPS"))
 STREAM_FIELDS = frozenset({"model", "input", "voice", "response_format", "speed"})
 _SENTENCE_END = re.compile(r"[.!?\u3002\uff01\uff1f]+[\"'\u201d\u2019)]*(?=\s|$)")
 
@@ -56,17 +77,20 @@ os.makedirs(VOICES_DIR, exist_ok=True)
 import perth  # noqa: E402
 if perth.PerthImplicitWatermarker is None:
     perth.PerthImplicitWatermarker = perth.DummyWatermarker
-from chatterbox.tts import ChatterboxTTS  # noqa: E402
+if MODEL_VARIANT == "turbo":
+    from chatterbox.tts_turbo import ChatterboxTurboTTS as ChatterboxModel  # noqa: E402
+else:
+    from chatterbox.tts import ChatterboxTTS as ChatterboxModel  # noqa: E402
 
 with tracer.start_as_current_span("voice.tts.model_load") as span:
-    span.set_attribute("model", "chatterbox")
+    span.set_attribute("model", MODEL_NAME)
     span.set_attribute("device", DEVICE)
-    log.info("voice.tts.model_loading", extra={"model": "chatterbox", "device": DEVICE})
-    model = ChatterboxTTS.from_pretrained(device=DEVICE)
+    log.info("voice.tts.model_loading", extra={"model": MODEL_NAME, "device": DEVICE})
+    model = ChatterboxModel.from_pretrained(device=DEVICE)
     SAMPLE_RATE = model.sr
     span.set_attribute("sample_rate", SAMPLE_RATE)
     log.info("voice.tts.model_ready", extra={
-        "model": "chatterbox", "sample_rate": SAMPLE_RATE, "device": DEVICE,
+        "model": MODEL_NAME, "sample_rate": SAMPLE_RATE, "device": DEVICE,
     })
 
 # This deployment intentionally runs one service process per GPU. This lock
@@ -117,7 +141,11 @@ model.s3gen.inference = _configured_s3_inference
 # Chatterbox also does not expose phase hooks. These narrow wrappers let us
 # distinguish autoregressive generation, diffusion/flow, and vocoding while
 # retaining the rest of the upstream generation implementation and output.
-_instrument_model_phase(model.t3, "inference", "t3_s")
+_instrument_model_phase(
+    model.t3,
+    "inference_turbo" if MODEL_VARIANT == "turbo" else "inference",
+    "t3_s",
+)
 _instrument_model_phase(model.s3gen, "flow_inference", "s3_flow_s")
 _instrument_model_phase(model.s3gen, "hift_inference", "hift_s")
 
@@ -323,7 +351,7 @@ def _generate_audio(
 @app.get("/health")
 def health():
     return jsonify({
-        "status": "ok", "model": "chatterbox", "device": DEVICE,
+        "status": "ok", "model": MODEL_NAME, "device": DEVICE,
         "sample_rate": SAMPLE_RATE, "cfm_steps": CFM_STEPS,
         "first_chunk_chars": FIRST_CHUNK_CHARS,
         "second_chunk_chars": SECOND_CHUNK_CHARS,
@@ -507,14 +535,18 @@ def upload_voice(name: str):
 
 if __name__ == "__main__":
     try:
-        warm_path = _voice_path("alloy")
+        warm_path = _voice_path(WARMUP_VOICE)
+        if REQUIRE_SUCCESSFUL_WARMUP and not warm_path:
+            raise RuntimeError(f"required warmup voice not found: {WARMUP_VOICE}")
         started = time.monotonic()
         _generate_audio("Ready.", warm_path, 0.5, "wav")
         log.info("voice.tts.warmup_done", extra={
-            "voice": "alloy" if warm_path else "default",
+            "voice": WARMUP_VOICE if warm_path else "default",
             "elapsed_s": round(time.monotonic() - started, 2),
         })
     except Exception as exc:
         log.warning("voice.tts.warmup_failed", extra={"error": str(exc)})
+        if REQUIRE_SUCCESSFUL_WARMUP:
+            raise
     log.info("voice.tts.listening", extra={"port": PORT})
     app.run(host="0.0.0.0", port=PORT, debug=False)
