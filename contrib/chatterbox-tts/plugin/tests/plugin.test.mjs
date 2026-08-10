@@ -4,10 +4,10 @@ import { readFile } from "node:fs/promises";
 import {
   FIRST_CHUNK_LENGTH, LATER_CHUNK_LENGTH, STREAM_IDLE_TIMEOUT_MS, MAX_AUDIO_BYTES,
   MAX_CHUNK_AUDIO_BYTES, DEFAULT_SETTINGS, DOM_CONTRACT,
-  StreamProtocolParser, NDJSONRecordReader, ChatterboxPlayer,
-  chunkSpeech, markdownToSpeech, audioPlaybackWindow, validateEndpoint, validateSettings,
+  StreamProtocolParser, NDJSONRecordReader, ChatterboxPlayer, AutoReadController,
+  chunkSpeech, markdownToSpeech, streamingSpeechSnapshot, audioPlaybackWindow, validateEndpoint, validateSettings,
   defaultEndpoint, loadSettings, enumerateAssistantMessages, deriveMessageIdentity,
-  locateActionContainer, extractAssistantText, hasEnhancementMarker,
+  locateActionContainer, extractAssistantText, inspectAutoReadView, hasEnhancementMarker,
   setButtonState, setLiveRegionText, createCoalescedCallback,
   default as plugin,
 } from "../pi-web-plugin.js";
@@ -158,8 +158,26 @@ test("settings reject unsafe endpoints and migrate HTTPS access to the same-orig
     endpoint: "http://192.168.200.42:9004", voice: "alloy", speed: 1,
   }) };
   assert.deepEqual(loadSettings(legacyStorage, httpsLocation), {
-    endpoint: "https://samwise.ssiops.com/chatterbox-tts", voice: "alloy", speed: 1,
+    endpoint: "https://samwise.ssiops.com/chatterbox-tts", voice: "alloy", speed: 1, autoRead: false,
   });
+  assert.equal(validateSettings({ ...DEFAULT_SETTINGS, autoRead: true }).autoRead, true);
+});
+
+test("streaming speech commits only stable prose and excludes incomplete Markdown", () => {
+  assert.equal(streamingSpeechSnapshot("Hello world").speech, "");
+  assert.equal(streamingSpeechSnapshot("Hello world. Next").speech, "Hello world.");
+  assert.equal(streamingSpeechSnapshot("Use `danger();` while waiting.").speech, "Use while waiting.");
+  assert.equal(streamingSpeechSnapshot("Use ``code ` inside`` safely.").speech, "Use safely.");
+  assert.equal(streamingSpeechSnapshot("Before.\n````js~ok\nhidden();\n```\nstill hidden\n````\nAfter.").speech, "Before. After.");
+  assert.equal(streamingSpeechSnapshot("Before.\n~~~js`ok\nhidden();\n~~~not a close\nstill hidden\n~~~\nAfter.").speech, "Before. After.");
+  assert.equal(streamingSpeechSnapshot("Math says x < y. Continue.").speech, "Math says x < y. Continue.");
+  assert.equal(streamingSpeechSnapshot("Image ![unfinished. alt").speech, "");
+  assert.equal(streamingSpeechSnapshot("Safe.\n```js\ndanger();\n```\nDone.").speech, "Safe. Done.");
+  assert.equal(streamingSpeechSnapshot("Read [the guide](https://example.test). More").speech, "Read the guide.");
+  assert.equal(streamingSpeechSnapshot("Do not read [unfinished. still").speech, "");
+  assert.equal(streamingSpeechSnapshot("A final tail", true).speech, "A final tail");
+  assert.equal(streamingSpeechSnapshot("Dr. Smith is ready. Next").speech, "Dr. Smith is ready.");
+  assert.equal(streamingSpeechSnapshot("Unicode works。 More").speech, "Unicode works。");
 });
 
 test("NDJSON reader accepts every byte boundary including split UTF-8", async () => {
@@ -330,6 +348,142 @@ test("rapid run replacement keeps immutable ownership and stale suppression", as
   assert.ok(states.slice(newStart).every((state) => state.run.messageId === "new"));
 });
 
+test("continuous auto playback starts successor synthesis before prior audio ends", async () => {
+  const calls = [];
+  const audio = fakeAudioContext();
+  const { player } = makePlayer({
+    audio,
+    fetch: async (_url, options) => {
+      calls.push(JSON.parse(options.body).input);
+      return streamResponse([audioRecord(0, wavBytes(calls.length - 1)), { type: "done", chunks: 1 }]);
+    },
+  });
+  await player.primeForAutoplay();
+  const run = await player.startAuto({ messageId: "turn", button: {} });
+  assert.equal(player.enqueueAuto(run, "First sentence."), true);
+  assert.equal(player.enqueueAuto(run, "Second sentence."), true);
+  player.finishAuto(run);
+  for (let index = 0; index < 20 && audio.sources.length < 2; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(calls, ["First sentence.", "Second sentence."]);
+  assert.equal(audio.sources.length, 2);
+  assert.equal(audio.sources[0].stopped, undefined, "the first source remains active during successor synthesis");
+  assert.ok(audio.sources[1].startArgs[0] >= 0.9, "the successor continues the shared audio timeline");
+  audio.sources[0].onended();
+  audio.sources[1].onended();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(player.activeRun, undefined);
+});
+
+test("auto-read baselines history, emits each sentence once, and flushes the final tail", async () => {
+  const enqueued = [];
+  let finished = 0;
+  const run = { queueChars: 0 };
+  const player = {
+    primeForAutoplay: async () => {},
+    startAuto: async () => run,
+    enqueueAuto: (_run, text) => { enqueued.push(text); return true; },
+    finishAuto: () => { finished += 1; },
+    stop: () => {},
+  };
+  const controller = new AutoReadController(player, { telemetry: () => {} });
+  const snapshot = (turnId, text, isStreaming = true) => ({
+    available: true, hidden: false, sessionId: "s", turnId,
+    messageId: `${turnId}:assistant`, text, isStreaming, button: {},
+  });
+  await controller.enable(snapshot("s:old", "Historical response.", false));
+  await controller.poll(snapshot("s:old", "Historical response.", false));
+  assert.deepEqual(enqueued, []);
+  await controller.poll(snapshot("s:new", "First sentence. Partial"));
+  await controller.poll(snapshot("s:new", "First sentence. Partial becomes second sentence."));
+  await controller.poll(snapshot("s:new", "First sentence. Partial becomes second sentence. Tail", false));
+  assert.deepEqual(enqueued, ["First sentence.", "Partial becomes second sentence.", "Tail"]);
+  assert.equal(finished, 1);
+});
+
+test("auto-read fails closed on revisions, navigation, and queue backpressure", async () => {
+  let stops = 0;
+  let finishes = 0;
+  const run = { queueChars: 2_000 };
+  const player = {
+    primeForAutoplay: async () => {}, startAuto: async () => run,
+    enqueueAuto: () => false, finishAuto: () => { finishes += 1; }, stop: () => { stops += 1; },
+  };
+  const controller = new AutoReadController(player, { telemetry: () => {} });
+  const base = {
+    available: true, hidden: false, sessionId: "s", turnId: "s:new",
+    messageId: "s:new:assistant", isStreaming: true, button: {},
+  };
+  await controller.enable({ ...base, turnId: "s:old", isStreaming: false, text: "" });
+  await controller.poll({ ...base, text: "Queue overflow." });
+  assert.equal(controller.suppressedTurnId, "s:new");
+  assert.equal(finishes, 1, "already queued audio drains instead of being destroyed");
+  await controller.poll({ ...base, isStreaming: false, text: "Queue overflow." });
+  assert.equal(controller.suppressedTurnId, undefined);
+
+  const revisionPlayer = { ...player, enqueueAuto: () => true };
+  const revision = new AutoReadController(revisionPlayer, { telemetry: () => {} });
+  await revision.enable({ ...base, turnId: "s:old", isStreaming: false, text: "" });
+  await revision.poll({ ...base, text: "Original sentence." });
+  await revision.poll({ ...base, text: "Changed sentence." });
+  assert.equal(revision.suppressedTurnId, "s:new");
+  assert.ok(stops >= 1, "a source revision cancels scheduled and queued audio");
+  await revision.poll({ ...base, sessionId: "other", turnId: "other:new", text: "Other." });
+  assert.equal(revision.turnId, undefined);
+});
+
+test("auto-read transitions cannot re-enable after disable and suppression is turn-scoped", async () => {
+  const gate = deferred();
+  let starts = 0;
+  const player = {
+    activeRun: undefined,
+    primeForAutoplay: () => gate.promise,
+    startAuto: async () => { starts += 1; return { queueChars: 0 }; },
+    enqueueAuto: () => true, finishAuto: () => {}, stop: () => {},
+  };
+  const controller = new AutoReadController(player, { telemetry: () => {} });
+  const old = {
+    available: true, hidden: false, sessionId: "s", turnId: "turn-old",
+    messageId: "message-old", text: "", isStreaming: false, button: {},
+  };
+  const enabling = controller.enable(old);
+  controller.disable(old);
+  gate.resolve();
+  assert.equal(await enabling, false);
+  assert.equal(controller.enabled, false);
+
+  player.primeForAutoplay = async () => {};
+  await controller.enable(old);
+  await controller.poll({ ...old, turnId: "turn-one", messageId: "message-one", text: "One.", isStreaming: true });
+  controller.suppressCurrent();
+  await controller.poll({ ...old, turnId: "turn-two", messageId: "message-two", text: "Two.", isStreaming: true });
+  assert.equal(starts, 2, "a distinct user turn is eligible even if a non-streaming transition was missed");
+});
+
+test("auto queue is bounded and stop cancels every cross-request source", async () => {
+  const audio = fakeAudioContext();
+  const { player } = makePlayer({
+    audio,
+    fetch: async () => streamResponse([audioRecord(0), { type: "done", chunks: 1 }]),
+  });
+  await player.primeForAutoplay();
+  const run = await player.startAuto({ messageId: "turn", button: {} });
+  for (let index = 0; index < 9; index += 1) {
+    assert.equal(player.enqueueAuto(run, `${index}.`), true);
+  }
+  assert.equal(run.queue.length, 8, "segments above the cap coalesce into the last queue entry");
+  assert.equal(run.queueChars, run.queue.reduce((total, value) => total + value.length, 0));
+  assert.equal(player.enqueueAuto(run, "x".repeat(2_001)), false);
+  for (let index = 0; index < 20 && audio.sources.length < 2; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  player.stop();
+  assert.ok(audio.sources.length >= 1);
+  assert.ok(audio.sources.every((source) => source.stopped === true));
+  assert.equal(player.activeRun, undefined);
+});
+
 test("observer-facing button/live updates are text-idempotent and callbacks coalesce", () => {
   const makeNode = () => {
     let text = "";
@@ -385,6 +539,24 @@ test("private DOM adapter remains narrow and package export follows PI WEB v1", 
   const action = {};
   assert.equal(locateActionContainer({ querySelector: () => action }), action);
   assert.equal(extractAssistantText({ querySelectorAll: () => [{ text: "Direct" }, { textContent: "only" }] }), "Direct\n\nonly");
+  const message = {
+    getAttribute: (name) => name === "data-index" ? "7" : null,
+    querySelectorAll: () => [{ text: "Streaming." }], querySelector: () => undefined,
+  };
+  const user = {
+    getAttribute: (name) => name === "data-index" ? "6" : null,
+  };
+  const root = {
+    querySelectorAll: (selector) => selector === DOM_CONTRACT.userSelector ? [user] : [message],
+  };
+  const view = { shadowRoot: root, isConnected: true, sessionId: "s", status: { isStreaming: true } };
+  root.host = view;
+  assert.deepEqual(inspectAutoReadView(root, { visibilityState: "visible" }), {
+    available: true, view, sessionId: "s", isStreaming: true, hidden: false,
+    turnId: "s:response:data-index:6", messageId: "s:assistant:data-index:7",
+    message, button: undefined, text: "Streaming.",
+  });
+  assert.equal(inspectAutoReadView({ host: { isConnected: false } }).available, false);
   assert.equal(hasEnhancementMarker({ querySelector: () => ({}) }), true);
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.deepEqual(pkg.piWeb.plugins, [{ id: "chatterbox-tts", module: "pi-web-plugin.js" }]);
