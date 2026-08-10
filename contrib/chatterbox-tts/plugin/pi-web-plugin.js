@@ -1261,15 +1261,19 @@ export class AutoReadController {
       }
     }
     if (snapshot.turnId !== this.turnId) {
+      // A PI steer/follow-up can introduce the next user turn without an
+      // observable non-streaming gap. Keep the same audio run open rather than
+      // baselining and silently skipping the new assistant continuation.
       if (!this.enqueueSnapshot(this.lastRaw, true)) return;
-      this.player.finishAuto(this.run);
-      this.baselineTurnId = snapshot.turnId;
-      this.turnId = undefined;
-      this.messageId = undefined;
-      this.run = undefined;
+      this.turnId = snapshot.turnId;
+      this.messageId = snapshot.messageId;
       this.lastRaw = "";
       this.committedSpeech = "";
-      return;
+      if (this.run) {
+        this.run.messageId = snapshot.messageId;
+        this.run.button = snapshot.button;
+      }
+      this.telemetry?.({ outcome: "auto.turn_queued" });
     }
     if (snapshot.messageId && snapshot.messageId !== this.messageId) {
       if (!this.enqueueSnapshot(this.lastRaw, true)) return;

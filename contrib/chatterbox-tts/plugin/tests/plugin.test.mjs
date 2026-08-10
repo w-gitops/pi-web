@@ -504,6 +504,33 @@ test("controller queues a second completed turn onto an active auto run", async 
   assert.equal(reopens, 1);
 });
 
+test("steered turns remain on the active Auto-Read run without a streaming gap", async () => {
+  const enqueued = [];
+  let starts = 0;
+  let finishes = 0;
+  const run = { mode: "auto", queueChars: 0 };
+  const player = {
+    activeRun: undefined, primeForAutoplay: async () => {},
+    startAuto: async () => { starts += 1; player.activeRun = run; return run; },
+    reopenAuto: () => true,
+    enqueueAuto: (_run, text) => { enqueued.push(text); return true; },
+    finishAuto: () => { finishes += 1; }, stop: () => {},
+  };
+  const controller = new AutoReadController(player, { telemetry: () => {} });
+  const snapshot = (turnId, messageId, text, isStreaming = true) => ({
+    available: true, hidden: false, sessionId: "s", turnId, messageId,
+    text, isStreaming, button: {},
+  });
+  await controller.enable(snapshot("old", "data-index:1", "Old.", false));
+  await controller.poll(snapshot("first", "data-index:3", "First response."));
+  await controller.poll(snapshot("steer", undefined, ""));
+  await controller.poll(snapshot("steer", "data-index:5", "Steered continuation."));
+  await controller.poll(snapshot("steer", "data-index:5", "Steered continuation.", false));
+  assert.deepEqual(enqueued, ["First response.", "Steered continuation."]);
+  assert.equal(starts, 1);
+  assert.equal(finishes, 1);
+});
+
 test("auto-read fails closed on revisions, navigation, and queue backpressure", async () => {
   let stops = 0;
   let finishes = 0;
