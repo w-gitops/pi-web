@@ -8,7 +8,7 @@ import {
   chunkSpeech, markdownToSpeech, streamingSpeechSnapshot, audioPlaybackWindow, validateEndpoint, validateSettings,
   defaultEndpoint, loadSettings, enumerateAssistantMessages, deriveMessageIdentity,
   locateActionContainer, extractAssistantText, inspectAutoReadView, hasEnhancementMarker,
-  setButtonState, setLiveRegionText, createCoalescedCallback,
+  setButtonState, setLiveRegionText, shouldStopForDetachedButton, createCoalescedCallback,
   default as plugin,
 } from "../pi-web-plugin.js";
 
@@ -658,6 +658,13 @@ test("observer-facing button/live updates are text-idempotent and callbacks coal
   assert.equal(reconciliations, 2);
   assert.equal(button.textWrites, 1, "a later observer callback must not rewrite button text");
   assert.equal(live.textWrites, 1, "a later observer callback must not rewrite live-region text");
+});
+
+test("detached message buttons stop manual playback but preserve Auto-Read", () => {
+  const detachedRoot = { contains: () => false };
+  assert.equal(shouldStopForDetachedButton({ mode: "manual", button: {} }, detachedRoot), true);
+  assert.equal(shouldStopForDetachedButton({ mode: "auto", button: {} }, detachedRoot), false);
+  assert.equal(shouldStopForDetachedButton(undefined, detachedRoot), false);
 });
 
 test("private DOM adapter remains narrow and package export follows PI WEB v1", async () => {
