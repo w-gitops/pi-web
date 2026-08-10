@@ -1321,18 +1321,39 @@ function createBrowserRuntime() {
 
   const setAutoRead = async (enabled) => {
     const current = loadSettings();
-    if (enabled) {
-      if (!current.autoRead) {
-        const destination = new URL(current.endpoint).origin;
-        if (!window.confirm(`Auto-Read will automatically send new assistant prose to:\n${destination}\n\nEnable it for this browser?`)) return;
+    try {
+      if (enabled) {
+        if (!current.autoRead) {
+          const destination = new URL(current.endpoint).origin;
+          if (!window.confirm(`Auto-Read will automatically send new assistant prose to:\n${destination}\n\nEnable it for this browser?`)) return;
+        }
+        if (!await autoRead.enable(autoSnapshot())) return;
+      } else {
+        autoRead.disable(autoSnapshot());
+        player.releaseAutoplay();
       }
-      if (!await autoRead.enable(autoSnapshot())) return;
-    } else {
-      autoRead.disable(autoSnapshot());
-      player.releaseAutoplay();
+      saveSettings({ ...current, autoRead: enabled });
+      announce(enabled ? "Auto-Read enabled" : "Auto-Read disabled");
+      if (enabled) window.alert("Chatterbox Auto-Read is armed for the next assistant response.");
+    } catch (error) {
+      autoRead.playbackFailed();
+      window.alert(`Chatterbox Auto-Read could not be armed: ${error?.message ?? "unknown error"}`);
     }
-    saveSettings({ ...current, autoRead: enabled });
-    announce(enabled ? "Auto-Read enabled" : "Auto-Read disabled");
+  };
+
+  const showAutoReadStatus = () => {
+    const snapshot = autoSnapshot();
+    const settings = loadSettings();
+    window.alert([
+      `Saved preference: ${settings.autoRead ? "on" : "off"}`,
+      `Controller: ${autoRead.enabled ? "armed" : "not armed"}`,
+      `Audio context: ${player.context?.state ?? "not created"}`,
+      `Audio keepalive: ${player.autoplayKeepalive ? "active" : "inactive"}`,
+      `DOM adapter: ${snapshot.available ? "ready" : "unavailable"}`,
+      `Session streaming: ${snapshot.available ? String(snapshot.isStreaming) : "unknown"}`,
+      `Turn detected: ${snapshot.turnId ? "yes" : "no"}`,
+      `Active speech run: ${player.activeRun?.mode ?? "none"}`,
+    ].join("\n"));
   };
 
   const reconcile = (chatRoot) => {
@@ -1414,7 +1435,7 @@ function createBrowserRuntime() {
   };
   document.addEventListener("pointerdown", unlockPersistedAutoRead, { capture: true });
   document.addEventListener("keydown", unlockPersistedAutoRead, { capture: true });
-  browserRuntime = { player, autoRead, setAutoRead, stop: () => {
+  browserRuntime = { player, autoRead, setAutoRead, showAutoReadStatus, stop: () => {
     autoRead.suppressCurrent();
     player.stop();
   }, dispose: async () => {
@@ -1475,6 +1496,7 @@ const plugin = {
           { id: "configure", title: "Configure Chatterbox TTS", description: "Set and check the browser-local speech server, voice, and speed", group: "Voice", run: configureBrowser },
           { id: "enable-auto-read", title: "Enable / Resume Chatterbox Auto-Read", description: "Unlock audio and read new assistant responses while they stream", group: "Voice", enabled: () => !runtime?.autoRead.enabled, run: () => runtime?.setAutoRead(true) },
           { id: "disable-auto-read", title: "Disable Chatterbox Auto-Read", description: "Stop speech and disable automatic reading", group: "Voice", enabled: () => Boolean(runtime?.autoRead.enabled || loadSettings().autoRead), run: () => runtime?.setAutoRead(false) },
+          { id: "auto-read-status", title: "Check Chatterbox Auto-Read Status", description: "Show browser audio and streaming detector state", group: "Voice", run: () => runtime?.showAutoReadStatus() },
           { id: "stop", title: "Stop Chatterbox Speech", description: "Stop current synthesis or playback and suppress the rest of this turn", group: "Voice", enabled: () => Boolean(runtime?.player.activeRun), run: () => runtime?.stop() },
           { id: "reload", title: "Reload Chatterbox TTS", description: "Reload PI WEB to activate the latest local TTS plugin version", group: "Voice", run: () => window.location.reload() },
         ],
