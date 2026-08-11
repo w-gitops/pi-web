@@ -10,6 +10,7 @@
     "plugins": [
       {
         "id": "chatterbox-tts",
+        "browserRoot": ".",
         "module": "pi-web-plugin.js"
       }
     ]

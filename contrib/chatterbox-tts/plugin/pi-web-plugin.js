@@ -1637,7 +1637,7 @@ async function configureBrowser() {
 }
 
 const plugin = {
-  apiVersion: 1,
+  apiVersion: 2,
   name: "Chatterbox TTS",
   activate: () => {
     const runtime = typeof window !== "undefined" && typeof document !== "undefined" ? createBrowserRuntime() : undefined;
