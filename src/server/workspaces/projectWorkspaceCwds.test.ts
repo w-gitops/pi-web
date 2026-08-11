@@ -56,7 +56,5 @@ function workspacesFor(owner: Project, paths: string[]): WorkspaceListing[] {
     path,
     label: path,
     isMain: index === 0,
-    isGitRepo: true,
-    isGitWorktree: true,
   }));
 }

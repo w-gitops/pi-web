@@ -23,6 +23,7 @@ function daemonCollaborators(patch: Partial<SessionServiceDependencyInput> = {})
     logger: { info() { /* no-op */ } },
     notificationStore: new SessionNotificationStore(),
     unreadStore: new SessionUnreadStore(),
+    onUnreadChanged: () => { /* no-op */ },
     catalogRefreshStatus: { isRefreshInFlight: () => false },
     subsessionsEnabled: false,
     askUserEnabled: true,

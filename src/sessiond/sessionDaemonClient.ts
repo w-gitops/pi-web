@@ -14,8 +14,17 @@ export type SessionDaemonAgentProfileResult =
   | { status: "unavailable"; error: string }
   | { status: "invalid"; error: string };
 
+export interface SessionDaemonRequestOptions {
+  signal?: AbortSignal;
+}
+
 export interface SessionDaemonRequestClient {
-  request(method: string, path: string, body?: unknown): Promise<{ statusCode: number; headers: Record<string, string>; body: string }>;
+  request(
+    method: string,
+    path: string,
+    body?: unknown,
+    options?: SessionDaemonRequestOptions,
+  ): Promise<{ statusCode: number; headers: Record<string, string>; body: string }>;
 }
 
 export interface SessionDaemonClientOptions {
@@ -35,10 +44,17 @@ export class SessionDaemonClient {
     this.activeContext = options.activeContext ?? (() => context.active());
   }
 
-  async request(method: string, path: string, body?: unknown): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> {
+  async request(
+    method: string,
+    path: string,
+    body?: unknown,
+    options: SessionDaemonRequestOptions = {},
+  ): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> {
     const payload = body === undefined ? undefined : JSON.stringify(body);
-    if (this.baseUrl !== undefined && this.baseUrl !== "") return this.requestUrl(method, path, payload);
-    return this.requestSocket(method, path, payload);
+    if (this.baseUrl !== undefined && this.baseUrl !== "") {
+      return this.requestUrl(method, path, payload, options.signal);
+    }
+    return this.requestSocket(method, path, payload, options.signal);
   }
 
   getActiveAgentProfile(): Promise<SessionDaemonAgentProfileResult> {
@@ -54,9 +70,9 @@ export class SessionDaemonClient {
     return new WebSocket(`ws+unix:${this.socketPath}:${path}`);
   }
 
-  private async requestUrl(method: string, path: string, payload?: string) {
+  private async requestUrl(method: string, path: string, payload?: string, signal?: AbortSignal) {
     const headers = new Headers(activeW3cTraceHeaders(this.activeContext()));
-    const init: RequestInit = { method, headers };
+    const init: RequestInit = { method, headers, ...(signal === undefined ? {} : { signal }) };
     if (payload !== undefined && payload !== "") {
       headers.set("content-type", "application/json");
       init.body = payload;
@@ -69,7 +85,7 @@ export class SessionDaemonClient {
     };
   }
 
-  private requestSocket(method: string, path: string, payload?: string): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> {
+  private requestSocket(method: string, path: string, payload?: string, signal?: AbortSignal): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> {
     const headers: Record<string, string | number> = activeW3cTraceHeaders(this.activeContext());
     if (payload !== undefined && payload !== "") {
       headers["content-type"] = "application/json";
@@ -81,6 +97,7 @@ export class SessionDaemonClient {
           socketPath: this.socketPath,
           path,
           method,
+          ...(signal === undefined ? {} : { signal }),
           headers,
         },
         (response) => {

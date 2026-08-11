@@ -59,6 +59,10 @@ Defaults:
 
 Updating recreates the Docker `sessiond` container. Active Pi agent runtimes in this Docker install may stop, so update while sessions are idle. Persisted PI WEB state, Pi config, and session history under the data directory are kept.
 
+A runtime update always runs the installer in the install directory, so every update refreshes the Docker asset files, regenerates the Compose environment, rebuilds the image, and recreates the services. Changes to `compose.yml`, the `Dockerfile`, `pi-web-docker`, and the internal helpers therefore reach a running install no matter where the update was started.
+
+The installer picks its behavior from where it runs, without a flag. On the host it detects the Docker host setup and records it in `.env`. Inside a container, such as an update started from the Updates panel, it reuses those recorded facts, because a container cannot observe its host: from inside a Linux container, a Docker Desktop for Mac host looks like native Linux Docker. Rerun the installer on the host after changing the host itself, for example moving the Docker socket or changing the docker group.
+
 Inside the Docker runtime, the Updates panel uses `pi-web-docker` for status, update, and restart commands. Update and restart commands first start a detached helper container with the same Docker/host mounts and generated Compose environment, including the project name, ports/data paths, helper image, and generated UID/GID/Docker group. After scheduling the helper, the command streams that helper's logs inline and prints the `docker logs -f` command needed to reconnect. The helper still runs independently, so work continues even when `web`, `sessiond`, or the PI WEB terminal that launched the command exits.
 
 ### Command matrix
@@ -105,7 +109,7 @@ Common environment variables written to `.env`:
 | `PI_WEB_DOCKER_DATA_DIR` | persistent data bind mount |
 | `PI_WEB_DOCKER_INSTALL_DIR` | absolute runtime install directory mounted back into the containers for Docker helper commands |
 | `PI_WEB_DOCKER_REF` | Git ref used when `pi-web-docker update` refreshes Docker asset templates |
-| `PI_WEB_DOCKER_HOST_PROFILE`, `HOSTEXEC_MODE` | detected host profile and host-command capability toggle |
+| `PI_WEB_DOCKER_HOST_PROFILE`, `PI_WEB_DOCKER_SOCKET_SOURCE`, `HOSTEXEC_MODE` | Docker host facts: detected host profile, host Docker socket path, and host-command capability toggle |
 | `PI_WEB_DOCKER_EXTRA_HOST_PATHS` | optional whitespace-separated existing absolute paths to bind-mount read/write at the same path |
 | `PI_WEB_BIND_ADDR`, `PI_WEB_PORT` | host bind address and port |
 | `PI_WEB_VERSION` | npm version/range for `@jmfederico/pi-web`; Pi Coding Agent resolves from PI WEB's npm peer dependency |
@@ -117,7 +121,7 @@ Common environment variables written to `.env`:
 | `COMPOSE_PROJECT_NAME` | Docker Compose project name used by host-side lifecycle commands and detached update/restart helpers; defaults to `pi-web` and is not exported to the long-lived services |
 | `HOSTEXEC_IMAGE` | helper image used by `hostexec` |
 
-Host-derived IDs and the Docker host profile are refreshed on rerun unless you explicitly override the IDs. User-facing values such as data directory, bind address, port, image names, upload limit, extra host paths, base image, Node.js settings, extra packages, and npm package selection are preserved from an existing `.env` unless you pass a flag or environment override.
+Host-derived IDs and the Docker host facts are refreshed on every rerun **on the host** unless you explicitly override the IDs. A rerun from inside a container reuses the recorded values instead; see [Updating](#runtime-installupdate). User-facing values such as data directory, bind address, port, image names, upload limit, extra host paths, base image, Node.js settings, extra packages, and npm package selection are preserved from an existing `.env` unless you pass a flag or environment override.
 
 The installer also writes a generated `compose.override.yml` in the install directory. `pi-web-docker` loads the generated `.env` and Compose override explicitly for runtime commands and passes the generated `COMPOSE_PROJECT_NAME` to Docker Compose, so an unrelated ambient Compose project name cannot redirect lifecycle commands. The project name stays scoped to this lifecycle control path instead of entering web, terminal, or agent environments. Re-run `pi-web-docker install` or `pi-web-docker update` instead of editing generated files by hand. Extra environment variables for the containers go in `container.env` instead; see [Container environment](#container-environment).
 

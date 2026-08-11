@@ -145,7 +145,7 @@ function dispatchShortcutThroughApp(app: PiWebApp, target: HTMLElement): Keyboar
 }
 
 async function openAuthenticationDialog(app: PiWebApp): Promise<HTMLElement> {
-  setAppState(app, { authDialog: { step: "method" } });
+  setAppState(app, { authDialog: { step: "method", machineId: "local" } });
   const container = renderApp(app);
   const dialog = requiredElement(container.querySelector<AuthDialog>("auth-dialog"), "authentication dialog");
   await dialog.updateComplete;
@@ -280,8 +280,6 @@ function workspace(): Workspace {
     path: "/repo",
     label: "main",
     isMain: true,
-    isGitRepo: true,
-    isGitWorktree: false,
     effectiveConfig: {},
   };
 }

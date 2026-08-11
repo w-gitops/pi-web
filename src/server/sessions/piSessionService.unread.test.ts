@@ -837,6 +837,51 @@ describe("PiSessionService daemon-owned unread state", () => {
       await service.dispose();
     }
   });
+  it("reports unread changes to the machine status projection as they are recorded", async () => {
+    const onUnreadChanged = vi.fn();
+    const unreadStore = new SessionUnreadStore({ createCatalogId: () => "catalog-test" });
+    const fake = fakeRuntime("session-1");
+    const service = new PiSessionService(new CapturingSessionEventHub(), {
+      agentDir: TEST_AGENT_DIR,
+      modelRuntime: testModelRuntime,
+      createAgentRuntime: runtimeCreator(fake.runtime),
+      sessionManager: sessionGateway([sessionRecord("session-1")]),
+      archiveStore: emptyArchiveStore(),
+      heartbeatIntervalMs: 60_000,
+      unreadStore,
+      onUnreadChanged,
+    });
+
+    try {
+      await service.status(sessionRef("session-1"));
+      expect(onUnreadChanged).not.toHaveBeenCalled();
+
+      completeRuntimeWork(fake);
+
+      // The projection reads in-memory unread state, so it is told as soon as
+      // the completion is recorded rather than after the durable flush.
+      expect(onUnreadChanged).toHaveBeenCalledTimes(1);
+
+      await service.acknowledgeUnread("session-1", {
+        cwd: WORKSPACE_CWD,
+        catalogId: "catalog-test",
+        throughCompletionOrder: 1,
+      });
+
+      expect(onUnreadChanged).toHaveBeenCalledTimes(2);
+
+      await service.acknowledgeUnread("session-1", {
+        cwd: WORKSPACE_CWD,
+        catalogId: "catalog-test",
+        throughCompletionOrder: 1,
+      });
+
+      // Nothing changed, so the projection is not asked to recompute again.
+      expect(onUnreadChanged).toHaveBeenCalledTimes(2);
+    } finally {
+      await service.dispose();
+    }
+  });
 });
 
 function completeRuntimeWork(runtime: ReturnType<typeof fakeRuntime>): void {
