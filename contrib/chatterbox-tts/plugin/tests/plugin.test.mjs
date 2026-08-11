@@ -735,7 +735,7 @@ test("detached message buttons stop manual playback but preserve Auto-Read", () 
   assert.equal(shouldStopForDetachedButton(undefined, detachedRoot), false);
 });
 
-test("private DOM adapter remains narrow and package export follows PI WEB v1", async () => {
+test("private DOM adapter remains narrow and package export follows PI WEB v2", async () => {
   assert.doesNotMatch(DOM_CONTRACT.assistantSelector, /user|thinking|tool/);
   const messages = [{ id: 1 }];
   assert.deepEqual(enumerateAssistantMessages({ querySelectorAll: () => messages }), messages);
@@ -766,7 +766,9 @@ test("private DOM adapter remains narrow and package export follows PI WEB v1", 
   assert.equal(inspectAutoReadView({ host: { isConnected: false } }).available, false);
   assert.equal(hasEnhancementMarker({ querySelector: () => ({}) }), true);
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-  assert.deepEqual(pkg.piWeb.plugins, [{ id: "chatterbox-tts", module: "pi-web-plugin.js" }]);
-  assert.equal(plugin.apiVersion, 1);
+  assert.deepEqual(pkg.piWeb.plugins, [{
+    id: "chatterbox-tts", browserRoot: ".", module: "pi-web-plugin.js",
+  }]);
+  assert.equal(plugin.apiVersion, 2);
   assert.equal(typeof plugin.activate, "function");
 });
