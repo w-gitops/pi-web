@@ -589,16 +589,94 @@ describe("Docker command assets", () => {
     expect(log).not.toContain("run -d");
   });
 
-  dockerCommandIt("executes the detached runtime update action through Compose without nesting helpers", async () => {
+  dockerCommandIt("runs the detached runtime update through the installer without nesting helpers", async () => {
     const installDir = await createRuntimeInstall();
     const fakeDocker = await installFakeDocker();
 
     await runDockerCommand(["__run-detached", "update"], runtimeEnv(fakeDocker, installDir));
 
-    const log = await readFile(fakeDocker.logPath, "utf8");
-    expect(log).toContain("compose --project-name pi-web-test --env-file .env -f compose.yml -f compose.override.yml build --pull --no-cache");
-    expect(log).toContain("compose --project-name pi-web-test --env-file .env -f compose.yml -f compose.override.yml up -d --force-recreate --remove-orphans");
+    // Rebuild and recreate read the Compose files in the install directory, so
+    // updates go through the installer that refreshes them. Otherwise Docker
+    // asset changes would never reach a running install.
+    const installerCalls = await readFile(join(installDir, "installer-calls.log"), "utf8");
+    expect(installerCalls).toContain(`install.sh --install-dir ${installDir}`);
+    // The installer drives Docker itself, so the helper must not schedule another helper.
+    const log = await readFile(fakeDocker.logPath, "utf8").catch(() => "");
     expect(log).not.toContain("run -d");
+  });
+
+  dockerCommandIt("reuses the recorded Docker host setup when the installer runs inside a container", async () => {
+    const installDir = await createRecordedHostInstall("recorded-mac-install", [
+      "PI_WEB_DOCKER_HOST_PROFILE=mac-docker-desktop",
+      "PI_WEB_DOCKER_SOCKET_SOURCE=/Users/dev/.docker/run/docker.sock",
+      "HOSTEXEC_MODE=disabled",
+    ]);
+    const envFile = join(installDir, ".env");
+
+    const result = await execUtf8("sh", [
+      join(repoRoot, "docker", "install.sh"),
+      "--install-dir", installDir,
+      "--asset-dir", join(repoRoot, "docker"),
+      "--skip-compose",
+    ], { ...cleanProcessEnv(), PI_WEB_DOCKER_RUNTIME: "1" });
+
+    // Detection here would report this Linux test host. The recorded Mac setup
+    // has to win, including the Docker Desktop socket path.
+    const override = await readFile(join(installDir, "compose.override.yml"), "utf8");
+    expect(result.stderr).toContain("Reused the recorded PI WEB Docker host profile: mac-docker-desktop");
+    expect(override).toContain("source: '/Users/dev/.docker/run/docker.sock'");
+    expect(override).not.toContain("target: '/host'");
+    expect(await readFile(envFile, "utf8")).toContain("PI_WEB_DOCKER_HOST_PROFILE=mac-docker-desktop");
+    // The asset files still refresh, which is the point of the rerun.
+    expect(await readFile(join(installDir, "compose.yml"), "utf8")).toContain("container.env");
+  });
+
+  dockerCommandIt("reuses the recorded Docker host setup for dev Compose inside a container", async () => {
+    const devRoot = await createDevRepoFixture();
+    const fakeDocker = await installFakeDocker();
+    await mkdir(join(devRoot, ".pi-web"), { recursive: true });
+    await writeFile(join(devRoot, ".pi-web", "docker-compose-dev.generated.env"), [
+      "PI_WEB_UID=1234",
+      "PI_WEB_GID=2345",
+      "DOCKER_GID=3456",
+      `PI_WEB_DOCKER_DATA_DIR=${join(tempDir, "dev-reuse-data")}`,
+      `PI_WEB_DOCKER_DEV_REPO_ROOT=${devRoot}`,
+      "PI_WEB_DOCKER_HOST_PROFILE=mac-docker-desktop",
+      "PI_WEB_DOCKER_SOCKET_SOURCE=/Users/dev/.docker/run/docker.sock",
+      "HOSTEXEC_MODE=disabled",
+      "COMPOSE_PROJECT_NAME=pi-web-dev-test",
+      "",
+    ].join("\n"), "utf8");
+
+    // Dev Compose also runs inside detached helper containers. Detecting there
+    // would rewrite a Mac dev stack's mounts as if the host were native Linux.
+    await execUtf8(join(devRoot, "docker", "internal", "dev", "compose"), ["ps"], {
+      ...cleanProcessEnv(),
+      PATH: `${fakeDocker.binDir}:${process.env["PATH"] ?? ""}`,
+      FAKE_DOCKER_LOG: fakeDocker.logPath,
+      PI_WEB_DOCKER_RUNTIME: "1",
+      PI_WEB_DOCKER_RUNTIME_ENV_FILE: "/dev/null",
+    });
+
+    const override = await readFile(join(devRoot, ".pi-web", "docker-compose-dev.host.generated.yml"), "utf8");
+    expect(override).toContain("source: '/Users/dev/.docker/run/docker.sock'");
+    expect(override).not.toContain("target: '/host'");
+  });
+
+  dockerCommandIt("refuses an in-container install without a recorded Docker host setup", async () => {
+    const freshDir = join(tempDir, "not-installed");
+
+    // Intentional failure path: a container cannot detect the host, so there is
+    // nothing to fall back to for a first install.
+    const result = await execUtf8AllowFailure("sh", [
+      join(repoRoot, "docker", "install.sh"),
+      "--install-dir", freshDir,
+      "--asset-dir", join(repoRoot, "docker"),
+      "--skip-compose",
+    ], { ...cleanProcessEnv(), PI_WEB_DOCKER_RUNTIME: "1" });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("run the installer on the Docker host first");
   });
 });
 
@@ -658,6 +736,39 @@ async function createRuntimeInstall(): Promise<string> {
   // create the user-owned container environment file when it is missing.
   await mkdir(join(installDir, "internal"), { recursive: true });
   await copyFile(join(repoRoot, "docker", "internal", "host-profile.sh"), join(installDir, "internal", "host-profile.sh"));
+  // Updates run the installed installer to refresh Docker assets. Record its
+  // arguments instead of fetching real assets.
+  const installerPath = join(installDir, "install.sh");
+  await writeFile(installerPath, `#!/usr/bin/env sh
+set -eu
+printf 'install.sh %s\n' "$*" >>${shellSingleQuote(join(installDir, "installer-calls.log"))}
+`, "utf8");
+  await chmod(installerPath, 0o755);
+  return installDir;
+}
+
+/**
+ * Install directory whose .env records a host setup, without the extra host
+ * paths the lifecycle fixture uses, so regenerating the override does not
+ * depend on paths existing on the test machine.
+ */
+async function createRecordedHostInstall(name: string, envLines: string[], overrideContents?: string): Promise<string> {
+  const installDir = join(tempDir, name);
+  await mkdir(installDir, { recursive: true });
+  await writeFile(join(installDir, ".env"), [
+    "PI_WEB_UID=1234",
+    "PI_WEB_GID=2345",
+    "DOCKER_GID=3456",
+    `PI_WEB_DOCKER_DATA_DIR=${join(installDir, "data")}`,
+    `PI_WEB_DOCKER_INSTALL_DIR=${installDir}`,
+    "PI_WEB_BIND_ADDR=127.0.0.1",
+    "PI_WEB_PORT=12345",
+    "PI_WEB_IMAGE=pi-web:test",
+    "COMPOSE_PROJECT_NAME=pi-web-test",
+    ...envLines,
+    "",
+  ].join("\n"), "utf8");
+  await writeFile(join(installDir, "compose.override.yml"), overrideContents ?? "services: {}\n", "utf8");
   return installDir;
 }
 

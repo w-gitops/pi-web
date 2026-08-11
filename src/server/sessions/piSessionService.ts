@@ -835,6 +835,11 @@ export interface PiSessionServiceDependencies {
   /** Initial retry delay for durable unread publication failures. */
   unreadPublicationRetryDelayMs?: number;
   /**
+   * Called when unread state changed, so the machine status projection can
+   * recompute. The unread catalog itself stays the authority for unread detail.
+   */
+  onUnreadChanged?: () => void;
+  /**
    * Lets session startup report that provider model lists are refreshing while
    * a session is being constructed. Omit to report the startup phase alone.
    */
@@ -901,6 +906,7 @@ export class PiSessionService implements SessionRouteService {
   private readonly dialogWaiters = new ExtensionDialogWaiters();
   private readonly catalogRefreshStatus: CatalogRefreshStatus | undefined;
   private readonly unreadPublicationRetryInitialMs: number;
+  private readonly onUnreadChanged: (() => void) | undefined;
   private readonly pendingUnreadMutations: SessionUnreadMutation[] = [];
   private unreadPublication: Promise<void> | undefined;
   private unreadPublicationFailure: unknown;
@@ -919,6 +925,7 @@ export class PiSessionService implements SessionRouteService {
     this.now = deps.now ?? (() => new Date());
     this.notificationStore = deps.notificationStore ?? new SessionNotificationStore();
     this.unreadStore = deps.unreadStore ?? new SessionUnreadStore();
+    this.onUnreadChanged = deps.onUnreadChanged;
     this.pendingAskStore = deps.pendingAskStore ?? new PendingAskStore();
     this.pendingExtensionDialogStore = deps.pendingExtensionDialogStore ?? new PendingExtensionDialogStore();
     this.extensionDialogsTimeoutMs = deps.extensionDialogsTimeoutMs ?? DEFAULT_EXTENSION_DIALOGS_TIMEOUT_MS;
@@ -3106,6 +3113,10 @@ export class PiSessionService implements SessionRouteService {
   }
 
   private publishUnreadMutations(mutations: readonly SessionUnreadMutation[]): Promise<void> {
+    // The store applied the mutations already, so the status projection is told
+    // now rather than after the durable flush: it reads in-memory unread state
+    // and must not lag behind the rows the browser is about to see.
+    if (mutations.length > 0) this.onUnreadChanged?.();
     this.enqueueUnreadMutations(mutations);
     this.unreadPublicationFlushRequested = true;
     if (this.unreadPublication === undefined && this.unreadPublicationRetryTimer !== undefined) {

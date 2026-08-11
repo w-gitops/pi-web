@@ -8,12 +8,12 @@ import type { WorkspaceUploadBatchState } from "../workspaceUploadState";
 // Genuine Lit event-wiring extraction (upload input/form submit and file-tree
 // row clicks) routes through the shared, type-guarded template-inspection escape
 // hatch; see ../templateInspection.testSupport for the proportionality
-// rationale. Viewer content messaging is asserted via the public
-// workspaceFileViewerStatusLabel seam instead of scraping Lit markup.
+// rationale. The extracted stateful viewer has its own happy-dom coverage.
 import { findOptionalTemplateEventHandlerAfterMarker, templateClickHandlerForText, templateEventHandlerAfterMarker } from "../templateInspection.testSupport";
 import { ModalSurface } from "./ModalSurface";
 import { deepActiveElement } from "./modalLayerRegistry";
-import { WorkspaceFilesPanel, startDirectWorkspaceUpload, uploadBatchProgressValue, uploadBatchStatusLabel, workspaceFileViewerStatusLabel, workspaceUploadBatchesForScope, workspaceUploadReviewDefaults, workspaceUploadReviewError } from "./WorkspaceFilesPanel";
+import { WorkspaceFilesPanel, startDirectWorkspaceUpload, uploadBatchProgressValue, uploadBatchStatusLabel, workspaceUploadBatchesForScope, workspaceUploadReviewDefaults, workspaceUploadReviewError } from "./WorkspaceFilesPanel";
+import type { WorkspaceFileViewer } from "./WorkspaceFileViewer";
 
 afterEach(() => {
   document.body.replaceChildren();
@@ -186,25 +186,22 @@ describe("workspace-files-panel file tree boundary", () => {
     expect(onExpandDir).toHaveBeenCalledWith("src");
     expect(onSelectFile).toHaveBeenCalledWith("src/main.ts");
     expect(onSelectFile).toHaveBeenCalledWith("README.md");
-
-    // Viewer messaging (selected binary file) is a content concern; assert it
-    // through the public seam rather than the rendered template.
-    expect(workspaceFileViewerStatusLabel(workspacePanelContext({
-      selectedFilePath: "README.md",
-      selectedFileContent: binaryFileContent("README.md", 4096),
-    }))).toBe("Binary file: README.md · 4.0 KB");
   });
-});
 
-describe("workspaceFileViewerStatusLabel", () => {
-  it("messages empty, loading, and binary viewer states while deferring to real viewers", () => {
-    expect(workspaceFileViewerStatusLabel(workspacePanelContext({ selectedFilePath: undefined }))).toBe("Select a file.");
-    expect(workspaceFileViewerStatusLabel(workspacePanelContext({ selectedFilePath: "" }))).toBe("Select a file.");
-    expect(workspaceFileViewerStatusLabel(workspacePanelContext({ selectedFilePath: "notes.md", selectedFileContent: undefined }))).toBe("Loading notes.md…");
-    expect(workspaceFileViewerStatusLabel(workspacePanelContext({
-      selectedFilePath: "logo.png",
-      selectedFileContent: { ...binaryFileContent("logo.png", 10), mediaType: "image" },
-    }))).toBeUndefined();
+  it("passes the selected workspace file scope into the contained viewer", async () => {
+    const file = textFileContent("README.md");
+    const panel = new WorkspaceFilesPanel();
+    panel.context = workspacePanelContext({ selectedFilePath: file.path, selectedFileContent: file });
+    document.body.append(panel);
+    await panel.updateComplete;
+
+    const viewer = requiredElement(panel.shadowRoot?.querySelector<WorkspaceFileViewer>("workspace-file-viewer"), "workspace file viewer");
+    expect(viewer.machineId).toBe("local");
+    expect(viewer.projectId).toBe("project-1");
+    expect(viewer.workspaceId).toBe("workspace-1");
+    expect(viewer.selectedPath).toBe("README.md");
+    expect(viewer.file).toBe(file);
+    expect(viewer.loadError).toBeUndefined();
   });
 });
 
@@ -379,8 +376,21 @@ function binaryFileContent(path: string, size: number): FileContentResponse {
   };
 }
 
+function textFileContent(path: string): FileContentResponse {
+  return {
+    path,
+    language: "typescript",
+    encoding: "utf8",
+    size: 12,
+    modifiedAt: "2026-06-25T00:00:00.000Z",
+    content: "const x = 1;",
+    truncated: false,
+    binary: false,
+  };
+}
+
 function workspacePanelContext(patch: Partial<WorkspacePanelContext> = {}): WorkspacePanelContext {
-  const workspace = patch.workspace ?? { id: "workspace-1", projectId: "project-1", path: "/tmp/project", label: "main", isMain: true, isGitRepo: true, isGitWorktree: false, effectiveConfig: {} };
+  const workspace = patch.workspace ?? { id: "workspace-1", projectId: "project-1", path: "/tmp/project", label: "main", isMain: true, effectiveConfig: {} };
   return {
     machine: patch.machine ?? { id: "local", name: "Local", kind: "local" },
     workspace,
@@ -392,6 +402,7 @@ function workspacePanelContext(patch: Partial<WorkspacePanelContext> = {}): Work
       deleteFile: vi.fn<WorkspacePanelContext["files"]["deleteFile"]>(() => Promise.reject(new Error("not implemented"))),
       moveFile: vi.fn<WorkspacePanelContext["files"]["moveFile"]>(() => Promise.reject(new Error("not implemented"))),
     },
+    backend: patch.backend ?? { request: vi.fn<NonNullable<WorkspacePanelContext["backend"]>["request"]>(() => Promise.resolve(null)) },
     prompt: patch.prompt ?? { insertText: vi.fn<WorkspacePanelContext["prompt"]["insertText"]>(), getText: vi.fn<WorkspacePanelContext["prompt"]["getText"]>(() => ""), getSelection: vi.fn<WorkspacePanelContext["prompt"]["getSelection"]>(() => null) },
     terminal: patch.terminal ?? { open: vi.fn<WorkspacePanelContext["terminal"]["open"]>(), runCommand: vi.fn<WorkspacePanelContext["terminal"]["runCommand"]>(() => Promise.reject(new Error("not implemented"))) },
     host: patch.host ?? { requestRender: vi.fn<WorkspacePanelContext["host"]["requestRender"]>() },
@@ -399,12 +410,8 @@ function workspacePanelContext(patch: Partial<WorkspacePanelContext> = {}): Work
     expandedDirs: patch.expandedDirs ?? {},
     selectedFilePath: patch.selectedFilePath,
     selectedFileContent: patch.selectedFileContent,
+    selectedFileLoadError: patch.selectedFileLoadError,
     fileTreeStale: patch.fileTreeStale ?? false,
-    gitStatus: patch.gitStatus,
-    selectedDiffPath: patch.selectedDiffPath,
-    selectedDiff: patch.selectedDiff,
-    selectedStagedDiff: patch.selectedStagedDiff,
-    gitStale: patch.gitStale ?? false,
     activeTerminalCount: patch.activeTerminalCount ?? 0,
     selectedTerminalId: patch.selectedTerminalId,
     terminalAutoStart: patch.terminalAutoStart ?? false,
@@ -415,8 +422,6 @@ function workspacePanelContext(patch: Partial<WorkspacePanelContext> = {}): Work
     onStartWorkspaceUpload: patch.onStartWorkspaceUpload ?? vi.fn<WorkspacePanelContext["onStartWorkspaceUpload"]>(() => undefined),
     onCancelWorkspaceUpload: patch.onCancelWorkspaceUpload ?? vi.fn<WorkspacePanelContext["onCancelWorkspaceUpload"]>(),
     onClearWorkspaceUpload: patch.onClearWorkspaceUpload ?? vi.fn<WorkspacePanelContext["onClearWorkspaceUpload"]>(),
-    onRefreshGit: patch.onRefreshGit ?? vi.fn<WorkspacePanelContext["onRefreshGit"]>(),
-    onSelectDiff: patch.onSelectDiff ?? vi.fn<WorkspacePanelContext["onSelectDiff"]>(),
     onSelectTerminal: patch.onSelectTerminal ?? vi.fn<WorkspacePanelContext["onSelectTerminal"]>(),
   };
 }

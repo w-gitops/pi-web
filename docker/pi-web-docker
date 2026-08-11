@@ -374,8 +374,8 @@ container_env_file_for_data_dir() {
   esac
 }
 
-# Compose fails when a declared env_file is absent, so guarantee the
-# user-owned file exists for installs made before it was introduced.
+# Compose fails when a declared env_file is absent, so guarantee the user-owned
+# file exists before any Compose command runs.
 ensure_runtime_container_env() {
   container_env_root=$1
   container_env_data_dir=$(required_env_file_value "$container_env_root/.env" PI_WEB_DOCKER_DATA_DIR)
@@ -475,7 +475,11 @@ run_restart_all() {
   compose_for_install restart web sessiond
 }
 
-run_runtime_host_update() {
+# Updates always run the installed installer, which refreshes the Docker assets
+# and regenerates the Compose environment before rebuilding and recreating. The
+# installer reuses the recorded host facts when it runs inside a container, so
+# the same path is correct from the host and from a detached helper.
+run_runtime_installer_update() {
   root=$(runtime_root)
   require_runtime_compose_assets "$root"
   installer=$(runtime_installer "$root")
@@ -524,14 +528,7 @@ run_update() {
   require_clean_dev_update_checkout
   case "$(docker_mode)" in
     runtime)
-      if ! is_truthy "${PI_WEB_DOCKER_RUNTIME:-}"; then
-        run_runtime_host_update
-      fi
-      cache_bust=${CACHE_BUST:-pi-web-docker-$(date -u +%Y%m%dT%H%M%SZ)}
-      log "Building PI WEB runtime image with CACHE_BUST=$cache_bust ..."
-      CACHE_BUST=$cache_bust runtime_compose build --pull --no-cache
-      log "Recreating PI WEB runtime services ..."
-      runtime_compose up -d --force-recreate --remove-orphans
+      run_runtime_installer_update
       ;;
     dev)
       dev_update_fast_forward

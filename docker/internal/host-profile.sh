@@ -98,6 +98,44 @@ pi_web_docker_host_detect_docker_gid() {
   printf '0\n'
 }
 
+# True when running inside a PI WEB Docker container. The Compose environment
+# sets this marker for the services, and detached helper containers pass it on.
+pi_web_docker_host_in_container() {
+  case "${PI_WEB_DOCKER_RUNTIME:-}" in
+    ""|0|false|FALSE|False) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Host facts are detected once on the host and then persisted. A container
+# cannot observe the host it runs on: from inside a Linux container, a Docker
+# Desktop for Mac host is indistinguishable from native Linux Docker. Reuse the
+# persisted facts there instead of detecting them again, and detect only when
+# running on the host itself.
+pi_web_docker_host_resolve_profile() {
+  pi_web_persisted_profile=${1:-}
+  pi_web_persisted_hostexec=${2:-}
+  pi_web_persisted_socket=${3:-}
+
+  if pi_web_docker_host_in_container && [ -n "$pi_web_persisted_profile" ]; then
+    PI_WEB_DETECTED_DOCKER_HOST_PROFILE=$pi_web_persisted_profile
+    if [ -n "$pi_web_persisted_hostexec" ]; then
+      PI_WEB_DETECTED_HOSTEXEC_MODE=$pi_web_persisted_hostexec
+    else
+      case "$pi_web_persisted_profile" in
+        linux-native-docker) PI_WEB_DETECTED_HOSTEXEC_MODE=nsenter ;;
+        *) PI_WEB_DETECTED_HOSTEXEC_MODE=disabled ;;
+      esac
+    fi
+    PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE=${pi_web_persisted_socket:-/var/run/docker.sock}
+    PI_WEB_DOCKER_HOST_PROFILE_REUSED=1
+    return 0
+  fi
+
+  PI_WEB_DOCKER_HOST_PROFILE_REUSED=0
+  pi_web_docker_host_detect_profile
+}
+
 pi_web_docker_host_detect_profile() {
   PI_WEB_DETECTED_HOST_OS=$(uname -s 2>/dev/null || printf 'unknown')
   PI_WEB_DETECTED_DOCKER_CONTEXT=
