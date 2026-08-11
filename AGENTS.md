@@ -11,6 +11,10 @@ If you make changes that affect `src/server/sessiond.ts`, session runtime owners
 
 Changes to the web/API/UI side generally only require the `pi-web-ui-dev.service` autoreload/restart path.
 
+## w-gitops fork production upgrades
+
+This fork's native production installation has a guarded deployment procedure under `.agents/skills/fork-native-upgrade/SKILL.md`. Use that skill and `scripts/fork-native-upgrade.sh --yes` for every production upgrade. Never replace the global package with raw `npm install` or suppress lifecycle scripts; native dependencies must pass preflight before either service restarts. This section and the associated skill/script are fork-only operational assets and must not be proposed upstream.
+
 ## Documentation boundaries
 
 `README.md` is a concise landing page and quick start. Keep it focused on what PI WEB is, basic requirements, the shortest supported install path, essential commands, the core model, and links to detailed documentation.
