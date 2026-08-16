@@ -9,6 +9,8 @@ import { shouldRequestEarlierMessages } from "../chatHistoryLoading";
 import { ChatScrollController, distanceFromScrollBottom, findFirstVisibleArticle, isNearScrollBottom, type ChatAnchorScrollPosition, type ChatScrollRestoreResult } from "../chatScrollPosition";
 import type { AskUserSubmission, PendingAskUser, PendingExtensionDialog, QueuedSessionMessage, SessionActivity, SessionStatus, SessionWarningSeverity } from "../api";
 import type { ClosedExtensionDialog } from "../appState";
+import { assistantMessageProjection } from "../plugins/assistantOutput";
+import type { PluginAssistantMessage, PluginMachine, QualifiedAssistantMessageActionContribution, WorkspaceHost } from "../plugins/types";
 import {
   notificationAnnouncementLabel,
   notificationDismissLabel,
@@ -186,6 +188,9 @@ function chatMessageModelLabel(message: ChatLine): string | undefined {
 export class ChatView extends LitElement {
   @property({ attribute: false }) messages: ChatLine[] = [];
   @property() sessionId = "";
+  @property({ attribute: false }) pluginMachine?: PluginMachine;
+  @property({ attribute: false }) assistantMessageActions: QualifiedAssistantMessageActionContribution[] = [];
+  @property({ attribute: false }) pluginHost?: WorkspaceHost;
   @property({ type: Number }) messageStart = 0;
   @property({ type: Number }) messageEnd = 0;
   @property({ type: Number }) messageTotal = 0;
@@ -906,13 +911,34 @@ export class ChatView extends LitElement {
   }
 
   private renderMessageActions(message: ChatLine, key: string) {
-    if (!this.isCopyableMessage(message)) return null;
     const copied = this.copiedMessageKey === key;
+    const machine = this.pluginMachine;
+    const projected = machine === undefined ? undefined : assistantMessageProjection(
+      message,
+      Number(key),
+      this.sessionId,
+      machine,
+      this.status?.isStreaming === true && Number(key) === this.messages.length - 1,
+    );
+    const host = this.pluginHost;
+    const actionMessage = projected;
+    const actionHost = host;
+    const pluginActions = actionMessage === undefined || actionHost === undefined ? [] : this.assistantMessageActions.filter((action) => {
+      try {
+        return action.visible?.({ message: actionMessage, host: actionHost }) ?? true;
+      } catch (error) {
+        console.warn(`Failed to evaluate PI WEB message action ${action.id}`, error);
+        return false;
+      }
+    });
+    if (!this.isCopyableMessage(message) && pluginActions.length === 0) return null;
+    const pluginActionButtons = actionMessage === undefined || actionHost === undefined
+      ? null
+      : this.renderPluginMessageActions(pluginActions, actionMessage, actionHost);
     return html`
       <div class="msg-actions" aria-label="Message actions">
-        <button type="button" class="msg-action" title=${copied ? "Copied" : "Copy message"} aria-label=${`${copied ? "Copied" : "Copy"} ${message.role} message`} @click=${(event: MouseEvent) => { void this.copyMessage(message, key, event); }}>
-          <span aria-hidden="true">${copied ? "✓" : "⧉"}</span>
-        </button>
+        ${this.isCopyableMessage(message) ? html`<button type="button" class="msg-action" title=${copied ? "Copied" : "Copy message"} aria-label=${`${copied ? "Copied" : "Copy"} ${message.role} message`} @click=${(event: MouseEvent) => { void this.copyMessage(message, key, event); }}><span aria-hidden="true">${copied ? "✓" : "⧉"}</span></button>` : null}
+        ${pluginActionButtons}
       </div>
     `;
   }
@@ -937,6 +963,19 @@ export class ChatView extends LitElement {
       .join("\n\n");
     this.messageCopyTextCache.set(message, text);
     return text;
+  }
+
+  private renderPluginMessageActions(actions: QualifiedAssistantMessageActionContribution[], message: PluginAssistantMessage, host: WorkspaceHost) {
+    const context = { message, host };
+    return actions.map((action) => {
+      try {
+        const actionState = action.state(context);
+        return html`<button type="button" class="msg-action" title=${actionState.title ?? actionState.label} aria-label=${actionState.label} aria-pressed=${actionState.pressed === undefined ? undefined : String(actionState.pressed)} ?disabled=${actionState.disabled === true} @click=${() => { Promise.resolve(action.run(context)).catch((error: unknown) => { console.warn(`Failed to run PI WEB message action ${action.id}`, error); }); }}><span aria-hidden="true">${actionState.icon ?? "▶"}</span></button>`;
+      } catch (error) {
+        console.warn(`Failed to render PI WEB message action ${action.id}`, error);
+        return null;
+      }
+    });
   }
 
   private async copyMessage(message: ChatLine, key: string, event: MouseEvent): Promise<void> {

@@ -33,6 +33,7 @@ import { corePlugin } from "../plugins/core";
 import { themePackPlugin } from "../plugins/themes";
 import { loadExternalPlugins, type ExternalPluginLoadResult } from "../plugins/external";
 import { PluginRegistry, installPluginRuntimeScope, installWorkspaceLabelScope, installWorkspacePanelScope } from "../plugins/registry";
+import { AssistantOutputProjector } from "../plugins/assistantOutput";
 import { createPluginWorkspaceBackend } from "../plugins/workspaceBackend";
 import { createWorkspaceFiles as createPluginWorkspaceFiles } from "../plugins/workspaceFiles";
 import { queryNamespace, readNamespacedString, setNamespacedQueryKey } from "../namespacedQueryArgs";
@@ -139,7 +140,9 @@ export class PiWebApp extends LitElement {
       notifications: this.notifications,
       onSelectedSessionReady: ({ machineId, session }) => {
         void this.commitReadyChatAfterRender(machineId, session);
+        this.notifyAssistantOutputSnapshot(machineId, session.id);
       },
+      onAppliedSessionEvent: (event) => { this.notifyAssistantOutputEvent(event); },
       replacePromptEditorText: async ({ machineId, sessionId, text }) => {
         await this.updateComplete;
         if (selectedMachineId(this.state) !== machineId || this.state.selectedSession?.id !== sessionId) return;
@@ -230,6 +233,7 @@ export class PiWebApp extends LitElement {
   private remoteRouteRestoreAttempt = 0;
   private remoteRouteRestoreInProgress = false;
   private readonly plugins = createPluginRegistry();
+  private readonly assistantOutput = new AssistantOutputProjector();
   private readonly loadedMachinePluginIds = new Set<string>();
   private readonly machinePluginLoadPromises = new Map<string, Promise<void>>();
   private gatewayPluginLoadPromise: Promise<void> | undefined;
@@ -366,6 +370,7 @@ export class PiWebApp extends LitElement {
     this.auth.dispose();
     this.sessions.dispose();
     this.notifications.dispose();
+    void this.plugins.dispose();
     this.realtime.close();
     this.closeMachineActivitySockets();
     if (this.piWebStatusTimer !== undefined) window.clearInterval(this.piWebStatusTimer);
@@ -1460,6 +1465,21 @@ export class PiWebApp extends LitElement {
     };
   }
 
+  private notifyAssistantOutputSnapshot(machineId: string, sessionId: string): void {
+    const machine = pluginMachineFromState(this.state);
+    if (machine.id !== machineId || this.state.selectedSession?.id !== sessionId) return;
+    const context = { machine, sessionId, host: this.createWorkspaceHost() };
+    this.plugins.notifyAssistantOutput(this.assistantOutput.snapshot({ machine, sessionId, messages: this.state.messages, status: this.state.status }), context);
+  }
+
+  private notifyAssistantOutputEvent(event: Parameters<AssistantOutputProjector["apply"]>[0]): void {
+    const session = this.state.selectedSession;
+    if (session === undefined) return;
+    const machine = pluginMachineFromState(this.state);
+    const projected = this.assistantOutput.apply(event, { machine, sessionId: session.id, messages: this.state.messages, status: this.state.status });
+    if (projected !== undefined) this.plugins.notifyAssistantOutput(projected, { machine, sessionId: session.id, host: this.createWorkspaceHost() });
+  }
+
   private createWorkspacePanelContext(workspace: Workspace): WorkspacePanelContext {
     const machine = pluginMachineFromState(this.state);
     const machineId = machine.id;
@@ -1663,6 +1683,8 @@ export class PiWebApp extends LitElement {
           console.warn(`Failed to register PI WEB plugin ${registration.id}`, error);
         }
       }
+      const selectedSessionId = this.state.selectedSession?.id;
+      if (selectedSessionId !== undefined) this.notifyAssistantOutputSnapshot(selectedMachineId(this.state), selectedSessionId);
       this.applyPreferredTheme(false);
       this.requestUpdate();
       return complete;
@@ -2070,7 +2092,7 @@ export class PiWebApp extends LitElement {
 
   private renderChatView(state: AppState, session: SessionInfo) {
     return html`
-      <chat-view .sessionId=${session.id} .messages=${state.messages} .messageStart=${state.messagePageStart} .messageEnd=${state.messagePageEnd} .messageTotal=${state.messagePageTotal} .hasMore=${state.messagePageStart > 0} .loadingMore=${state.isLoadingEarlierMessages} .isSendingPrompt=${state.sendingPrompts[session.id] === true} .isCompacting=${state.status?.isCompacting === true} .pendingMessageCount=${state.status?.pendingMessageCount ?? 0} .clientQueuedMessages=${state.clientQueuedSessionMessages[session.id] ?? []} .status=${state.status} .activity=${state.activity} .pendingAsk=${state.pendingAsk} .pendingDialogs=${state.pendingDialogs} .closedDialogs=${state.closedDialogs} .onAnswerDialog=${this.handleAnswerDialog} .onCancelDialog=${this.handleCancelDialog} .onDismissClosedDialog=${this.handleDismissClosedDialog} .askDraftSessionId=${machineSessionKey(selectedMachineId(state), session.id)} .onSubmitAsk=${this.handleSubmitAsk} .notificationInbox=${selectedNotificationView(state.selectedNotificationInbox)} .onClearServerQueue=${this.handleClearServerQueue} .onDismissWarning=${this.handleDismissWarning} .onDismissNotification=${this.handleDismissNotification} .onDismissAllNotifications=${this.handleDismissAllNotifications} .warningsVisible=${!this.sessionWarningVisibility.collapsed} .onToggleWarnings=${this.handleToggleWarnings} .onLoadMore=${() => this.withChatPrependTransition(() => this.sessions.loadEarlierMessages())}></chat-view>
+      <chat-view .sessionId=${session.id} .messages=${state.messages} .pluginMachine=${pluginMachineFromState(state)} .assistantMessageActions=${this.plugins.getAssistantMessageActions(selectedMachineId(state))} .pluginHost=${this.createWorkspaceHost()} .messageStart=${state.messagePageStart} .messageEnd=${state.messagePageEnd} .messageTotal=${state.messagePageTotal} .hasMore=${state.messagePageStart > 0} .loadingMore=${state.isLoadingEarlierMessages} .isSendingPrompt=${state.sendingPrompts[session.id] === true} .isCompacting=${state.status?.isCompacting === true} .pendingMessageCount=${state.status?.pendingMessageCount ?? 0} .clientQueuedMessages=${state.clientQueuedSessionMessages[session.id] ?? []} .status=${state.status} .activity=${state.activity} .pendingAsk=${state.pendingAsk} .pendingDialogs=${state.pendingDialogs} .closedDialogs=${state.closedDialogs} .onAnswerDialog=${this.handleAnswerDialog} .onCancelDialog=${this.handleCancelDialog} .onDismissClosedDialog=${this.handleDismissClosedDialog} .askDraftSessionId=${machineSessionKey(selectedMachineId(state), session.id)} .onSubmitAsk=${this.handleSubmitAsk} .notificationInbox=${selectedNotificationView(state.selectedNotificationInbox)} .onClearServerQueue=${this.handleClearServerQueue} .onDismissWarning=${this.handleDismissWarning} .onDismissNotification=${this.handleDismissNotification} .onDismissAllNotifications=${this.handleDismissAllNotifications} .warningsVisible=${!this.sessionWarningVisibility.collapsed} .onToggleWarnings=${this.handleToggleWarnings} .onLoadMore=${() => this.withChatPrependTransition(() => this.sessions.loadEarlierMessages())}></chat-view>
     `;
   }
 

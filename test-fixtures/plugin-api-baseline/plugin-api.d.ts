@@ -23,9 +23,13 @@ export interface PluginActivationContext {
 }
 export interface PluginActivationResult {
     contributions: PluginContributions;
+    /** Release browser resources owned by this plugin. Cleanup must be idempotent. */
+    dispose?: () => void | Promise<void>;
 }
 export interface PluginContributions {
     actions?: PluginAction[];
+    assistantOutputObservers?: AssistantOutputObserverContribution[];
+    assistantMessageActions?: AssistantMessageActionContribution[];
     workspacePanels?: WorkspacePanelContribution[];
     workspaceLabels?: WorkspaceLabelContribution[];
     themes?: ThemeContribution[];
@@ -35,6 +39,66 @@ export interface PluginMachine {
     id: string;
     name: string;
     kind: MachineKind;
+}
+export interface PluginAssistantOutput {
+    id: string;
+    sessionId: string;
+    machine: PluginMachine;
+    text: string;
+    state: "streaming" | "complete";
+}
+export type PluginAssistantOutputEvent = {
+    type: "snapshot";
+    output?: PluginAssistantOutput;
+} | {
+    type: "started";
+    output: PluginAssistantOutput;
+} | {
+    type: "delta";
+    output: PluginAssistantOutput;
+    delta: string;
+} | {
+    type: "completed";
+    output: PluginAssistantOutput;
+} | {
+    type: "interrupted";
+    sessionId: string;
+    outputId?: string;
+    reason: "session-changed" | "turn-started" | "session-cleared";
+};
+export interface AssistantOutputObserverContext {
+    machine: PluginMachine;
+    sessionId: string;
+    host: WorkspaceHost;
+}
+export interface AssistantOutputObserverContribution {
+    id: LocalContributionId;
+    onEvent(event: PluginAssistantOutputEvent, context: AssistantOutputObserverContext): void | Promise<void>;
+}
+export interface PluginAssistantMessage {
+    id: string;
+    sessionId: string;
+    machine: PluginMachine;
+    text: string;
+    streaming: boolean;
+}
+export interface AssistantMessageActionContext {
+    message: PluginAssistantMessage;
+    host: WorkspaceHost;
+}
+export interface AssistantMessageActionState {
+    label: string;
+    title?: string;
+    pressed?: boolean;
+    disabled?: boolean;
+    icon?: TemplateResult;
+}
+export interface AssistantMessageActionContribution {
+    id: LocalContributionId;
+    order?: number;
+    visible?: (context: AssistantMessageActionContext) => boolean;
+    state: (context: AssistantMessageActionContext) => AssistantMessageActionState;
+    run: (context: AssistantMessageActionContext) => void | Promise<void>;
 }
 export interface PluginRuntimeState {
     /** Identity of the currently selected machine. Undefined only on older hosts or before machines load. */

@@ -1636,18 +1636,88 @@ async function configureBrowser() {
   window.alert("Chatterbox TTS settings saved in this browser.");
 }
 
+function createContributionRuntime() {
+  let current;
+  let host;
+  const snapshot = () => current ? {
+    available: true,
+    hidden: false,
+    sessionKey: `${current.machine.id}:${current.sessionId}`,
+    turnId: current.id,
+    messageId: current.id,
+    text: current.text,
+    isStreaming: current.state === "streaming",
+  } : { available: false, hidden: false };
+  let autoRead;
+  const player = new ChatterboxPlayer({ onState: ({ run, state }) => {
+    if (run.mode === "auto" && state === "error") autoRead?.playbackFailed();
+    host?.requestRender();
+  } });
+  autoRead = new AutoReadController(player, { onNotice: (message) => console.info(`Chatterbox TTS: ${message}`) });
+  const observe = async (event, context) => {
+    host = context.host;
+    if (event.type === "interrupted") {
+      current = undefined;
+      autoRead.cancel(false);
+      return;
+    }
+    current = event.output;
+    await autoRead.poll(snapshot());
+  };
+  const setAutoRead = async (enabled) => {
+    const settings = loadSettings();
+    if (enabled) {
+      if (!settings.autoRead) {
+        const destination = new URL(settings.endpoint).origin;
+        if (!window.confirm(`Auto-Read will automatically send new assistant prose to:\n${destination}\n\nEnable it for this browser?`)) return;
+      }
+      if (!await autoRead.enable(snapshot())) return;
+    } else {
+      autoRead.disable(snapshot());
+      player.releaseAutoplay();
+    }
+    saveSettings({ ...settings, autoRead: enabled });
+    host?.requestRender();
+  };
+  return {
+    player,
+    autoRead,
+    observe,
+    setHost: (nextHost) => { host = nextHost; },
+    setAutoRead,
+    stop: () => { autoRead.suppressCurrent(); player.stop(); host?.requestRender(); },
+    dispose: () => player.dispose(),
+  };
+}
+
 const plugin = {
   apiVersion: 2,
   name: "Chatterbox TTS",
   activate: () => {
-    const runtime = typeof window !== "undefined" && typeof document !== "undefined" ? createBrowserRuntime() : undefined;
+    const runtime = typeof window !== "undefined" ? createContributionRuntime() : undefined;
     return {
+      dispose: () => runtime?.dispose(),
       contributions: {
+        assistantOutputObservers: runtime ? [{ id: "assistant-output", onEvent: (event, context) => runtime.observe(event, context) }] : [],
+        assistantMessageActions: runtime ? [{
+          id: "speak-message",
+          order: 100,
+          state: ({ message }) => ({
+            label: runtime.player.activeRun?.messageId === message.id ? "Stop speaking message" : "Speak assistant message",
+            title: runtime.player.activeRun?.messageId === message.id ? "Stop speech" : "Read aloud",
+            pressed: runtime.player.activeRun?.messageId === message.id,
+          }),
+          run: ({ message, host: actionHost }) => {
+            runtime.setHost(actionHost);
+            if (runtime.autoRead.turnId) runtime.autoRead.suppressCurrent();
+            return runtime.player.toggle({ messageId: message.id, text: message.text });
+          },
+        }] : [],
         actions: [
           { id: "configure", title: "Configure Chatterbox TTS", description: "Set and check the browser-local speech server, voice, and speed", group: "Voice", run: configureBrowser },
           { id: "enable-auto-read", title: "Enable / Resume Chatterbox Auto-Read", description: "Unlock audio and read new assistant responses while they stream", group: "Voice", enabled: () => !runtime?.autoRead.enabled, run: () => runtime?.setAutoRead(true) },
           { id: "disable-auto-read", title: "Disable Chatterbox Auto-Read", description: "Stop speech and disable automatic reading", group: "Voice", enabled: () => Boolean(runtime?.autoRead.enabled || loadSettings().autoRead), run: () => runtime?.setAutoRead(false) },
-          { id: "auto-read-status", title: "Check Chatterbox Auto-Read Status", description: "Show browser audio and streaming detector state", group: "Voice", run: () => runtime?.showAutoReadStatus() },
+          { id: "auto-read-status", title: "Check Chatterbox Auto-Read Status", description: "Show browser audio and streaming state", group: "Voice", run: () => window.alert(`Saved preference: ${loadSettings().autoRead ? "on" : "off"}\nController: ${runtime?.autoRead.enabled ? "armed" : "not armed"}\nActive speech run: ${runtime?.player.activeRun?.mode ?? "none"}`) },
           { id: "stop", title: "Stop Chatterbox Speech", description: "Stop current synthesis or playback and suppress the rest of this turn", group: "Voice", enabled: () => Boolean(runtime?.player.activeRun), run: () => runtime?.stop() },
           { id: "reload", title: "Reload Chatterbox TTS", description: "Reload PI WEB to activate the latest local TTS plugin version", group: "Voice", run: () => window.location.reload() },
         ],

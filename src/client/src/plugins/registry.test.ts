@@ -923,6 +923,34 @@ describe("PluginRegistry", () => {
 
     expect(remoteActivate).not.toHaveBeenCalled();
   });
+
+  it("routes assistant contributions by machine and disposes plugin resources", async () => {
+    const registry = new PluginRegistry();
+    const onEvent = vi.fn();
+    const dispose = vi.fn();
+    registry.register({
+      id: "speech",
+      plugin: {
+        apiVersion: 2,
+        name: "Speech",
+        activate: () => ({
+          dispose,
+          contributions: {
+            assistantOutputObservers: [{ id: "output", onEvent }],
+            assistantMessageActions: [{ id: "speak", state: () => ({ label: "Speak" }), run: () => undefined }],
+          },
+        }),
+      },
+    });
+    const host = { requestRender: vi.fn() };
+    const machine = { id: "local", name: "Local", kind: "local" as const };
+    registry.notifyAssistantOutput({ type: "snapshot" }, { machine, sessionId: "s1", host });
+
+    expect(onEvent).toHaveBeenCalledWith({ type: "snapshot" }, { machine, sessionId: "s1", host });
+    expect(registry.getAssistantMessageActions("local").map((action) => action.id)).toEqual(["speech:speak"]);
+    await registry.dispose();
+    expect(dispose).toHaveBeenCalledOnce();
+  });
 });
 
 function testWorkspace(patch: Partial<Workspace> = {}): Workspace {

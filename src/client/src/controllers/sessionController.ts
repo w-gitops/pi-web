@@ -56,6 +56,8 @@ export interface SessionControllerDependencies {
   notifications?: SessionNotificationSessionBridge;
   replacePromptEditorText?: (replacement: PromptEditorTextReplacement) => void | Promise<void>;
   onSelectedSessionReady?: (selection: SelectedSessionReady) => void;
+  /** Runs only after an accepted selected-session event has been reconciled into state. */
+  onAppliedSessionEvent?: (event: SessionUiEvent) => void;
 }
 
 interface BulkSessionMutationResult {
@@ -108,6 +110,7 @@ export class SessionController {
   private readonly notifications: SessionNotificationSessionBridge | undefined;
   private readonly replacePromptEditorText: SessionControllerDependencies["replacePromptEditorText"];
   private readonly onSelectedSessionReady: SessionControllerDependencies["onSelectedSessionReady"];
+  private readonly onAppliedSessionEvent: SessionControllerDependencies["onAppliedSessionEvent"];
   private selectionSeq = 0;
   private disposed = false;
   // Join-time stream watermark for the selected session. `seq` is the
@@ -139,6 +142,7 @@ export class SessionController {
     this.notifications = deps.notifications;
     this.replacePromptEditorText = deps.replacePromptEditorText;
     this.onSelectedSessionReady = deps.onSelectedSessionReady;
+    this.onAppliedSessionEvent = deps.onAppliedSessionEvent;
   }
 
   applyGlobalEvent(event: GlobalSessionEvent): void {
@@ -1494,6 +1498,7 @@ export class SessionController {
     } else if (event.type === "session.name") {
       this.applySessionName(event.sessionId, event.name);
     }
+    this.onAppliedSessionEvent?.(event);
   }
 
   private queueTranscriptEvent(event: SessionUiEvent): void {
@@ -1648,6 +1653,7 @@ export class SessionController {
       let messages = this.getState().messages;
       for (const event of events) messages = this.transcripts.applyLiveEvent(messages, event) ?? messages;
       if (messages !== this.getState().messages) this.setState({ messages });
+      for (const event of events) this.onAppliedSessionEvent?.(event);
     }
     if (this.pendingActivityBySession.size > 0) {
       const activities = Array.from(this.pendingActivityBySession.values());

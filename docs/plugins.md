@@ -575,6 +575,38 @@ Contribution ids authored in arrays remain local to the plugin. PI WEB qualifies
 
 For a local plugin the runtime and source ids are normally equal. A federated registration may machine-scope `runtimePluginId`, while `pluginId` and `workspace.provider.pluginId` remain the same source id.
 
+### Assistant output and message actions
+
+Speech, export, and accessibility plugins can observe normalized assistant prose without reading PI WEB's private DOM:
+
+```ts
+activate: () => ({
+  dispose: () => player.dispose(),
+  contributions: {
+    assistantOutputObservers: [{
+      id: "output",
+      onEvent: (event) => {
+        if (event.type === "delta") player.append(event.delta);
+        if (event.type === "completed") player.finish(event.output.text);
+        if (event.type === "interrupted") player.stop();
+      },
+    }],
+    assistantMessageActions: [{
+      id: "speak",
+      state: () => ({ label: "Read aloud" }),
+      run: ({ message, host }) => {
+        player.toggle(message.id, message.text);
+        host.requestRender();
+      },
+    }],
+  },
+})
+```
+
+Observers run after selected-session sequence filtering and transcript reconciliation. `snapshot` baselines the current selected output on initial load or reconnect; it is not a new-output notification. `started`, `delta`, and `completed` contain prose only and exclude thinking. `interrupted` tells a plugin to cancel work when a turn or selection boundary invalidates it. The output identity is stable for the displayed message within its session and includes the source machine/session context.
+
+PI WEB renders message actions in the assistant message header and owns their keyboard and accessible-button behavior. Contributions provide state and behavior, not DOM nodes. Call `host.requestRender()` when asynchronous action state changes. Optional activation `dispose()` releases audio contexts, requests, timers, and other plugin resources when the host is torn down; cleanup must be idempotent.
+
 ## Server module and workspace provider shape
 
 TypeScript server entries import the separately published Node declarations with `import type`:

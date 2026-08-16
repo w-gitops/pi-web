@@ -1,6 +1,6 @@
 import { html, svg } from "lit";
 import { requirePluginBackendRevision } from "../../../shared/pluginBackendProtocol";
-import type { PiWebPluginRegistration, PluginAction, PluginRuntimeContext, QualifiedContributionId, QualifiedPluginAction, QualifiedThemeContribution, QualifiedThemePairContribution, QualifiedWorkspaceLabelContribution, QualifiedWorkspacePanelContribution, ThemeContribution, ThemePairContribution, WorkspaceLabelContext, WorkspaceLabelContribution, WorkspaceLabelItem, WorkspacePanelContext, WorkspacePanelContribution, WorkspacePluginBinding } from "./types";
+import type { AssistantMessageActionContribution, AssistantOutputObserverContext, AssistantOutputObserverContribution, PiWebPluginRegistration, PluginAction, PluginAssistantOutputEvent, PluginRuntimeContext, QualifiedAssistantMessageActionContribution, QualifiedContributionId, QualifiedPluginAction, QualifiedThemeContribution, QualifiedThemePairContribution, QualifiedWorkspaceLabelContribution, QualifiedWorkspacePanelContribution, ThemeContribution, ThemePairContribution, WorkspaceLabelContext, WorkspaceLabelContribution, WorkspaceLabelItem, WorkspacePanelContext, WorkspacePanelContribution, WorkspacePluginBinding } from "./types";
 
 const idPattern = /^[a-z][a-z0-9.-]*$/u;
 const localIdPattern = /^[a-z][a-z0-9.-]*$/u;
@@ -18,8 +18,21 @@ type RegisteredPluginAction = Omit<PluginAction, "id"> & {
   sourcePluginId?: string;
 };
 
+type RegisteredAssistantOutputObserver = AssistantOutputObserverContribution & {
+  pluginId: string;
+  machineId?: string;
+  sourcePluginId?: string;
+};
+
+type RegisteredAssistantMessageAction = QualifiedAssistantMessageActionContribution & {
+  sourcePluginId?: string;
+};
+
 export class PluginRegistry {
   private readonly actions: RegisteredPluginAction[] = [];
+  private readonly assistantOutputObservers: RegisteredAssistantOutputObserver[] = [];
+  private readonly assistantMessageActions: RegisteredAssistantMessageAction[] = [];
+  private readonly disposers: (() => void | Promise<void>)[] = [];
   private readonly workspacePanels: QualifiedWorkspacePanelContribution[] = [];
   private readonly workspaceLabels: QualifiedWorkspaceLabelContribution[] = [];
   private readonly themes: QualifiedThemeContribution[] = [];
@@ -46,15 +59,18 @@ export class PluginRegistry {
     try {
       const apiVersion: unknown = plugin.apiVersion;
       if (apiVersion !== 2) throw new Error(`Unsupported browser plugin API version for ${sourcePluginId}: ${String(apiVersion)} (expected 2)`);
-      const contributions = plugin.activate(Object.freeze({
+      const activation = plugin.activate(Object.freeze({
         apiVersion: 2,
         pluginId: sourcePluginId,
         runtimePluginId,
         html,
         svg,
-      })).contributions;
+      }));
+      const contributions = activation.contributions;
       const contributionIds = new Set<QualifiedContributionId>();
       const actions = (contributions.actions ?? []).map((action) => this.qualifyAction(runtimePluginId, action, registration.machineId, registration.sourcePluginId, contributionIds));
+      const assistantOutputObservers = (contributions.assistantOutputObservers ?? []).map((observer) => this.qualifyAssistantOutputObserver(runtimePluginId, observer, registration.machineId, registration.sourcePluginId, contributionIds));
+      const assistantMessageActions = (contributions.assistantMessageActions ?? []).map((action) => this.qualifyAssistantMessageAction(runtimePluginId, action, registration.machineId, registration.sourcePluginId, contributionIds));
       const workspacePanels = (contributions.workspacePanels ?? []).map((panel) => this.qualifyWorkspacePanel(runtimePluginId, panel, registration.machineId, registration.sourcePluginId, backendRevision, contributionIds));
       const workspaceLabels = (contributions.workspaceLabels ?? []).map((contribution) => this.qualifyWorkspaceLabelContribution(runtimePluginId, contribution, registration.machineId, registration.sourcePluginId, backendRevision, contributionIds));
       const themes = registration.machineId === undefined
@@ -67,6 +83,9 @@ export class PluginRegistry {
       this.pluginIds.add(runtimePluginId);
       for (const contributionId of contributionIds) this.contributionIds.add(contributionId);
       this.actions.push(...actions);
+      this.assistantOutputObservers.push(...assistantOutputObservers);
+      this.assistantMessageActions.push(...assistantMessageActions);
+      if (activation.dispose !== undefined) this.disposers.push(activation.dispose);
       this.workspacePanels.push(...workspacePanels);
       this.workspaceLabels.push(...workspaceLabels);
       this.themes.push(...themes);
@@ -112,6 +131,32 @@ export class PluginRegistry {
       if (disabledReason !== undefined && disabledReason !== "") qualified.disabledReason = disabledReason;
       return qualified;
     });
+  }
+
+  getAssistantMessageActions(machineId: string): QualifiedAssistantMessageActionContribution[] {
+    return this.assistantMessageActions
+      .filter((action) => this.isContributionActive(action.pluginId, action.machineId, machineId, action.sourcePluginId))
+      .sort((left, right) => (left.order ?? 1000) - (right.order ?? 1000) || left.id.localeCompare(right.id));
+  }
+
+  notifyAssistantOutput(event: PluginAssistantOutputEvent, context: AssistantOutputObserverContext): void {
+    for (const observer of this.assistantOutputObservers) {
+      if (!this.isContributionActive(observer.pluginId, observer.machineId, context.machine.id, observer.sourcePluginId)) continue;
+      Promise.resolve(observer.onEvent(event, context)).catch((error: unknown) => {
+        console.warn(`Failed to notify PI WEB plugin assistant observer ${observer.pluginId}:${observer.id}`, error);
+      });
+    }
+  }
+
+  async dispose(): Promise<void> {
+    for (const dispose of [...this.disposers].reverse()) {
+      try {
+        await dispose();
+      } catch (error) {
+        console.warn("Failed to dispose PI WEB plugin", error);
+      }
+    }
+    this.disposers.length = 0;
   }
 
   getWorkspacePanels(): QualifiedWorkspacePanelContribution[] {
@@ -172,6 +217,35 @@ export class PluginRegistry {
       pluginId,
       localId: action.id,
       ...(shortcutAliases.length === 0 ? {} : { shortcutAliases }),
+      ...(machineId === undefined ? {} : { machineId }),
+      ...(sourcePluginId === undefined ? {} : { sourcePluginId }),
+    };
+  }
+
+  private qualifyAssistantOutputObserver(
+    pluginId: string,
+    observer: AssistantOutputObserverContribution,
+    machineId: string | undefined,
+    sourcePluginId: string | undefined,
+    contributionIds: Set<QualifiedContributionId>,
+  ): RegisteredAssistantOutputObserver {
+    this.qualify(pluginId, observer.id, contributionIds);
+    return { ...observer, pluginId, ...(machineId === undefined ? {} : { machineId }), ...(sourcePluginId === undefined ? {} : { sourcePluginId }) };
+  }
+
+  private qualifyAssistantMessageAction(
+    pluginId: string,
+    action: AssistantMessageActionContribution,
+    machineId: string | undefined,
+    sourcePluginId: string | undefined,
+    contributionIds: Set<QualifiedContributionId>,
+  ): RegisteredAssistantMessageAction {
+    const id = this.qualify(pluginId, action.id, contributionIds);
+    return {
+      ...action,
+      id,
+      pluginId,
+      localId: action.id,
       ...(machineId === undefined ? {} : { machineId }),
       ...(sourcePluginId === undefined ? {} : { sourcePluginId }),
     };
