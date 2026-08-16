@@ -27,7 +27,10 @@ wait_for_web() {
 
 native_preflight() {
   local install_dir=$1
-  node -e 'require(process.argv[1])' "$install_dir/node_modules/node-pty"
+  # npm may place dependencies either below the package (global/snapshot) or at
+  # the staging prefix root (isolated local install). Resolve exactly as Node
+  # would for code loaded from the candidate package instead of assuming layout.
+  node -e 'require(require.resolve("node-pty", { paths: [process.argv[1]] }))' "$install_dir"
   node "$install_dir/dist/cli.js" --version
 }
 
