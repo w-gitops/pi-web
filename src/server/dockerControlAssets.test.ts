@@ -208,7 +208,7 @@ describe("Docker command assets", () => {
     const fakeDocker = await installFakeDocker();
 
     const runtimeDoctor = await runDockerCommand(["doctor"], runtimeHostEnv(fakeDocker, installDir));
-    const devDoctor = await runDockerCommand(["--dev", "doctor"], {
+    const devDoctor = await runDockerCommand(["--dev", "--allow-root", "doctor"], {
       ...cleanProcessEnv(),
       PATH: `${fakeDocker.binDir}:${process.env["PATH"] ?? ""}`,
       FAKE_DOCKER_LOG: fakeDocker.logPath,
@@ -656,6 +656,7 @@ describe("Docker command assets", () => {
       FAKE_DOCKER_LOG: fakeDocker.logPath,
       PI_WEB_DOCKER_RUNTIME: "1",
       PI_WEB_DOCKER_RUNTIME_ENV_FILE: "/dev/null",
+      PI_WEB_DOCKER_ALLOW_ROOT: "1",
     });
 
     const override = await readFile(join(devRoot, ".pi-web", "docker-compose-dev.host.generated.yml"), "utf8");

@@ -132,7 +132,6 @@ export class SettingsDialog extends LitElement {
           .error=${this.sessiondError}
           .savedMessage=${this.savedMessage}
           .targetLabel=${settingsMachineTargetLabel(this.settingsTarget())}
-          .activeAgentProfile=${this.machineRuntime?.components?.sessiond.activeAgentProfile}
           .onReload=${() => this.reloadSessiondState()}
           .onSave=${(config: PiWebConfigValues) => this.saveSessiondConfig(config)}
         ></settings-sessiond-panel>

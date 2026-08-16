@@ -75,6 +75,7 @@ import { shouldShowMachinesSection, type AppNavigationPanel, type NavigationFocu
 import "./appShell/AppPanelEdgeControl";
 import "./appShell/AppRefreshControl";
 import { errorBanner } from "./errorBanner";
+import { deprecatedAgentInputsBanner, deprecatedAgentInputsWarnings } from "./deprecatedAgentInputsBanner";
 import { appStyles } from "./shared";
 
 
@@ -2143,6 +2144,7 @@ export class PiWebApp extends LitElement {
           ${this.renderContextBar()}
           ${this.renderMobileMainTabs()}
           ${errorBanner(state.error, () => { this.setState({ error: "" }); })}
+          ${deprecatedAgentInputsBanner(deprecatedAgentInputsWarnings(state.machines, state.machineRuntimes))}
           <div class="mobile-navigation-panel">${this.appShell.isMobileNavigationLayout ? this.renderNavigationPanel() : null}</div>
           ${state.selectedSession ? html`
             ${this.renderChatView(state, state.selectedSession)}
