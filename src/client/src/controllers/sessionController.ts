@@ -1,4 +1,5 @@
 import { api as defaultApi, type AskUserCloseResponse, type AskUserSubmission, type CommandResult, type ExtensionDialogAnswer, type ExtensionDialogCloseReason, type ExtensionDialogCloseResponse, type ExtensionDialogOutcome, type PendingAskUser, type PendingExtensionDialog, type PromptAttachment, type QueuedSessionMessage, type SessionActivity, type SessionBulkFailure, type SessionCleanupExecuteResponse, type SessionInfo, type SessionModelCatalogEntry, type SessionModelScopeMode, type SessionRef, type SessionStatus, type SessionTreeForkResult, type SessionTreeNavigateResult, type SessionTreeSummaryChoice, type Workspace } from "../api";
+import { isAuthRequiredError } from "../api/http";
 import type { AppState, ClosedExtensionDialog } from "../appState";
 import { forgetCachedNewSession, isCachedNewSessionInfo, markCachedNewSessionInfo, mergeCachedNewSessions, rememberCachedNewSession, stripCachedNewSessionMarker } from "../cachedNewSessions";
 import { textMessage } from "../chatMessages";
@@ -50,6 +51,10 @@ export interface SelectedSessionReady {
   session: SessionInfo;
 }
 
+export type PromptDeliveryResult =
+  | { ok: true; kind: "accepted" | "queued" | "local-command" }
+  | { ok: false; kind: "delivery-unknown" | "auth-required" | "rejected" };
+
 export interface SessionControllerDependencies {
   api?: typeof defaultApi;
   socket?: SessionEventSocket;
@@ -60,6 +65,8 @@ export interface SessionControllerDependencies {
   /** Runs only after an accepted selected-session event has been reconciled into state. */
   onAppliedSessionEvent?: (event: SessionUiEvent) => void;
   onModelScopeChanged?: (revision: number) => void;
+  /** Raised once when prompt delivery learns the proxy session requires reauthentication. */
+  onAuthenticationRequired?: () => void;
 }
 
 interface BulkSessionMutationResult {
@@ -114,6 +121,7 @@ export class SessionController {
   private readonly onSelectedSessionReady: SessionControllerDependencies["onSelectedSessionReady"];
   private readonly onAppliedSessionEvent: SessionControllerDependencies["onAppliedSessionEvent"];
   private readonly onModelScopeChanged: SessionControllerDependencies["onModelScopeChanged"];
+  private readonly onAuthenticationRequired: SessionControllerDependencies["onAuthenticationRequired"];
   private selectionSeq = 0;
   private disposed = false;
   // Join-time stream watermark for the selected session. `seq` is the
@@ -147,6 +155,7 @@ export class SessionController {
     this.onSelectedSessionReady = deps.onSelectedSessionReady;
     this.onAppliedSessionEvent = deps.onAppliedSessionEvent;
     this.onModelScopeChanged = deps.onModelScopeChanged;
+    this.onAuthenticationRequired = deps.onAuthenticationRequired;
   }
 
   applyGlobalEvent(event: GlobalSessionEvent): void {
@@ -305,9 +314,9 @@ export class SessionController {
     }
   }
 
-  async send(text: string, streamingBehavior?: "steer" | "followUp", attachments?: PromptAttachment[], delivery: PromptAttachmentDelivery = "inline") {
+  async send(text: string, streamingBehavior?: "steer" | "followUp", attachments?: PromptAttachment[], delivery: PromptAttachmentDelivery = "inline"): Promise<PromptDeliveryResult> {
     const session = this.getState().selectedSession;
-    if (!session || session.archived === true) return;
+    if (!session || session.archived === true) return { ok: false, kind: "rejected" };
 
     const trimmed = text.trim();
     const hasAttachments = attachments !== undefined && attachments.length > 0;
@@ -315,15 +324,19 @@ export class SessionController {
       if (!hasAttachments && trimmed.startsWith("/")) this.enqueuePendingSessionSend(session, { type: "command", text });
       else if (!hasAttachments && isShellInput(text)) this.enqueuePendingSessionSend(session, { type: "shell", text });
       else this.enqueuePendingSessionSend(session, { type: "prompt", text, streamingBehavior, attachments, delivery });
-      return;
+      return { ok: true, kind: "queued" };
     }
-    if (!hasAttachments && trimmed.startsWith("/")) return this.runCommand(text);
-    if (!hasAttachments && isShellInput(text)) return this.runShell(text);
+    if (!hasAttachments && trimmed.startsWith("/")) {
+      return this.deliverCommandToSession(session, text, selectedMachineId(this.getState()), { applyResult: true });
+    }
+    if (!hasAttachments && isShellInput(text)) {
+      return this.deliverShellToSession(session, text, selectedMachineId(this.getState()), { optimisticLine: true });
+    }
 
     // Capture the originating session/machine before any await so the request
     // and its sending indicator stay bound to the right session even if the
     // user navigates elsewhere mid-upload.
-    await this.deliverPromptToSession(session, text, streamingBehavior, attachments, delivery, selectedMachineId(this.getState()), { markSending: hasAttachments });
+    return this.deliverPromptToSession(session, text, streamingBehavior, attachments, delivery, selectedMachineId(this.getState()), { markSending: hasAttachments });
   }
 
   private markSendingPrompt(sessionId: string, sending: boolean): void {
@@ -383,12 +396,21 @@ export class SessionController {
   }
 
   private async deliverQueuedPendingSend(session: SessionInfo, machineId: string, queued: QueuedPendingSessionSend): Promise<boolean> {
-    if (queued.type === "prompt") return this.deliverPromptToSession(session, queued.text, queued.streamingBehavior, queued.attachments, queued.delivery, machineId, { markSending: true });
-    if (queued.type === "shell") return this.deliverShellToSession(session, queued.text, machineId, { optimisticLine: true });
-    return this.deliverCommandToSession(session, queued.text, machineId, { applyResult: true });
+    // Auth failures invoke onAuthenticationRequired inside the deliver helpers,
+    // return ok:false, and stop this flush. Never retry the failed item.
+    if (queued.type === "prompt") {
+      const result = await this.deliverPromptToSession(session, queued.text, queued.streamingBehavior, queued.attachments, queued.delivery, machineId, { markSending: true });
+      return result.ok;
+    }
+    if (queued.type === "shell") {
+      const result = await this.deliverShellToSession(session, queued.text, machineId, { optimisticLine: true });
+      return result.ok;
+    }
+    const result = await this.deliverCommandToSession(session, queued.text, machineId, { applyResult: true });
+    return result.ok;
   }
 
-  private async deliverPromptToSession(session: SessionInfo, text: string, streamingBehavior: "steer" | "followUp" | undefined, attachments: PromptAttachment[] | undefined, delivery: PromptAttachmentDelivery, machineId: string, options: { markSending: boolean }): Promise<boolean> {
+  private async deliverPromptToSession(session: SessionInfo, text: string, streamingBehavior: "steer" | "followUp" | undefined, attachments: PromptAttachment[] | undefined, delivery: PromptAttachmentDelivery, machineId: string, options: { markSending: boolean }): Promise<PromptDeliveryResult> {
     const hasAttachments = attachments !== undefined && attachments.length > 0;
     if (options.markSending) this.markSendingPrompt(session.id, true);
     try {
@@ -401,36 +423,42 @@ export class SessionController {
         await this.api.prompt(session, text, streamingBehavior, machineId, attachments);
       }
       this.markCachedNewSessionPersisted(session);
-      return true;
+      return { ok: true, kind: "accepted" };
     } catch (error) {
+      if (isAuthRequiredError(error)) return this.handleDeliveryAuthRequired();
+      // Transport TypeError (CORS/network/"Load failed") stays delivery-unknown.
+      // Do not classify it as auth and never retry this prompt POST. A later
+      // same-origin health probe may surface explicit AuthRequiredError via the
+      // recovery path when the proxy returns 401 + X-PI-Web-Reauth.
       if (error instanceof TypeError) {
         if (this.isSelectedSessionIdentity(session.id, machineId)) this.reconnectActiveSession();
         this.setState({ error: `Prompt delivery may be unknown because the connection failed. ${String(error)}` });
-      } else {
-        this.setState({ error: String(error) });
+        return { ok: false, kind: "delivery-unknown" };
       }
-      return false;
+      this.setState({ error: String(error) });
+      return { ok: false, kind: "rejected" };
     } finally {
       if (options.markSending) this.markSendingPrompt(session.id, false);
     }
   }
 
-  private async deliverShellToSession(session: SessionInfo, text: string, machineId: string, options: { optimisticLine: boolean }): Promise<boolean> {
+  private async deliverShellToSession(session: SessionInfo, text: string, machineId: string, options: { optimisticLine: boolean }): Promise<PromptDeliveryResult> {
     if (options.optimisticLine && this.getState().selectedSession?.id === session.id) {
       this.setState({ messages: [...this.getState().messages, textMessage("user", text)] });
     }
     try {
       await this.api.shell(session, text, machineId);
       this.markCachedNewSessionPersisted(session);
-      return true;
+      return { ok: true, kind: "local-command" };
     } catch (error) {
+      if (isAuthRequiredError(error)) return this.handleDeliveryAuthRequired();
       if (this.getState().selectedSession?.id === session.id) this.setState({ messages: [...this.getState().messages, textMessage("system", String(error))] });
       this.setState({ error: String(error) });
-      return false;
+      return { ok: false, kind: "rejected" };
     }
   }
 
-  private async deliverCommandToSession(session: SessionInfo, text: string, machineId: string, options: { applyResult: boolean }): Promise<boolean> {
+  private async deliverCommandToSession(session: SessionInfo, text: string, machineId: string, options: { applyResult: boolean }): Promise<PromptDeliveryResult> {
     // Commands are not inserted into the transcript optimistically: a builtin
     // command produces its own result line, and a runtime/skill command is
     // forwarded to the agent, which streams back the canonical (expanded)
@@ -443,14 +471,22 @@ export class SessionController {
       if (options.applyResult && this.isSelectedSessionIdentity(session.id, machineId)) this.applyCommandResult(result);
       else if (result.type === "select" || result.type === "tree") this.setState({ error: `Queued command “${text}” needs input; open the session and run it again.` });
       this.markCachedNewSessionPersisted(session);
-      return true;
+      return { ok: true, kind: "local-command" };
     } catch (error) {
+      if (isAuthRequiredError(error)) return this.handleDeliveryAuthRequired();
       if (this.getState().selectedSession?.id === session.id) this.setState({ messages: [...this.getState().messages, textMessage("system", String(error))] });
       this.setState({ error: String(error) });
-      return false;
+      return { ok: false, kind: "rejected" };
     } finally {
       this.markSendingPrompt(session.id, false);
     }
+  }
+
+  /** Raise the app auth gate once and return the editor-facing auth result. Never retries. */
+  private handleDeliveryAuthRequired(): PromptDeliveryResult {
+    this.onAuthenticationRequired?.();
+    this.setState({ error: "Session expired. Sign in again to continue. Your draft was kept — it may already have been sent, so verify the transcript before resending." });
+    return { ok: false, kind: "auth-required" };
   }
 
   private dropNextQueuedSessionMessage(sessionId: string): void {

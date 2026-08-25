@@ -86,10 +86,10 @@ describe("PromptEditor pending attachments across session switches", () => {
     triggerSessionSwitch(editor, { machineId: "local", sessionId: "session-b" });
     expect(Reflect.get(editor, "attachments")).toEqual([{ id: "attachment-1", kind: "file", name: "notes.txt", mimeType: "text/plain", data: "aGVsbG8=", size: 5 }]);
 
-    // Sending (resetComposer) consumes the attachment for session-a.
-    const resetComposer: unknown = Reflect.get(editor, "resetComposer");
-    if (typeof resetComposer !== "function") throw new Error("PromptEditor.resetComposer was unavailable");
-    Reflect.apply(resetComposer, editor, []);
+    // An accepted send consumes the attachment for session-a.
+    const applyAcceptedDelivery: unknown = Reflect.get(editor, "applyAcceptedDelivery");
+    if (typeof applyAcceptedDelivery !== "function") throw new Error("PromptEditor.applyAcceptedDelivery was unavailable");
+    Reflect.apply(applyAcceptedDelivery, editor, ["local", "session-a", "local:session-a", "", new Set(["attachment-1"])]);
     expect(Reflect.get(editor, "attachments")).toEqual([]);
 
     // Round-tripping through session-b and back must not resurrect it.
