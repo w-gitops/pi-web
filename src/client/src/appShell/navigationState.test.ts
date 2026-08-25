@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { defaultNavigationSection, expandedNavigationSection, isNavigationSectionCollapsed, toggleCollapsedNavigationSection, toggleNavigationSection } from "./navigationState";
+import type { ReactiveControllerHost } from "lit";
+import {
+  defaultNavigationSection,
+  expandedNavigationSection,
+  INITIAL_DESKTOP_COLLAPSED_NAVIGATION_SECTIONS,
+  isNavigationSectionCollapsed,
+  NavigationSectionsController,
+  toggleCollapsedNavigationSection,
+  toggleNavigationSection,
+} from "./navigationState";
 
 describe("navigationState", () => {
   it("defaults to the first incomplete selection section", () => {
@@ -51,4 +60,79 @@ describe("navigationState", () => {
     expect(toggleCollapsedNavigationSection(["sessions"], "machines")).toEqual(["machines", "sessions"]);
   });
 
+  it("starts Projects and Workspaces collapsed on desktop", () => {
+    expect(INITIAL_DESKTOP_COLLAPSED_NAVIGATION_SECTIONS).toEqual(["projects", "workspaces"]);
+
+    const controller = createNavigationSectionsController({
+      selectedProject: {},
+      selectedWorkspace: {},
+      isMobileLayout: false,
+    });
+
+    expect(controller.isCollapsed("projects")).toBe(true);
+    expect(controller.isCollapsed("workspaces")).toBe(true);
+    expect(controller.isCollapsed("machines")).toBe(false);
+    expect(controller.isCollapsed("sessions")).toBe(false);
+  });
+
+  it("lets desktop users expand Projects or Workspaces until the next page load", () => {
+    const controller = createNavigationSectionsController({
+      selectedProject: {},
+      selectedWorkspace: {},
+      isMobileLayout: false,
+    });
+
+    controller.toggle("projects");
+
+    expect(controller.isCollapsed("projects")).toBe(false);
+    expect(controller.isCollapsed("workspaces")).toBe(true);
+  });
+
+  it("keeps the mobile accordion independent of the desktop start-collapsed list", () => {
+    const nothingSelected = createNavigationSectionsController({
+      selectedProject: undefined,
+      selectedWorkspace: undefined,
+      isMobileLayout: true,
+    });
+    const bothSelected = createNavigationSectionsController({
+      selectedProject: {},
+      selectedWorkspace: {},
+      isMobileLayout: true,
+    });
+
+    expect(nothingSelected.isCollapsed("projects")).toBe(false);
+    expect(nothingSelected.isCollapsed("workspaces")).toBe(true);
+    expect(bothSelected.isCollapsed("projects")).toBe(true);
+    expect(bothSelected.isCollapsed("workspaces")).toBe(true);
+    expect(bothSelected.isCollapsed("sessions")).toBe(false);
+  });
 });
+
+function createNavigationSectionsController(options: {
+  selectedProject: object | undefined;
+  selectedWorkspace: object | undefined;
+  isMobileLayout: boolean;
+}): NavigationSectionsController {
+  return new NavigationSectionsController(
+    fakeReactiveControllerHost(),
+    () => ({ selectedProject: options.selectedProject, selectedWorkspace: options.selectedWorkspace }),
+    () => options.isMobileLayout,
+  );
+}
+
+function fakeReactiveControllerHost(): ReactiveControllerHost {
+  return {
+    addController() {
+      return;
+    },
+    removeController() {
+      return;
+    },
+    requestUpdate() {
+      return;
+    },
+    get updateComplete() {
+      return Promise.resolve(true);
+    },
+  };
+}
