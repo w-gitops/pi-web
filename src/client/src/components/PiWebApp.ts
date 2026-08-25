@@ -12,7 +12,7 @@ import { MachineController } from "../controllers/machineController";
 import { MachineStatusController } from "../controllers/machineStatusController";
 import { ProjectController } from "../controllers/projectController";
 import { PiWebStatusController } from "../controllers/piWebStatusController";
-import { SessionController } from "../controllers/sessionController";
+import { SessionController, type PromptDeliveryResult } from "../controllers/sessionController";
 import { SessionNotificationController } from "../controllers/sessionNotificationController";
 import { WorkspaceController } from "../controllers/workspaceController";
 import { emptyMachineNavigationSnapshot, machineNavigationSnapshotFromState, routeFromMachineNavigationSnapshot, SessionStorageMachineNavigationMemory, type MachineNavigationSnapshot, type WorkspaceRouteSurface } from "../controllers/machineNavigationMemory";
@@ -48,6 +48,7 @@ import { readSettingsSection, writeSettingsSection, type SettingsSection } from 
 import { applyActiveShortcutPreferences } from "../shortcutPreferences";
 import { createTerminalCommandRunsRuntime } from "../runtime/terminalRuntime";
 import { canDeleteWorkspace, isWorkspaceDeletionPending, isWorkspaceDeletionRunPending, latestWorkspaceDeletionRuns, pendingWorkspaceDeletionIds, targetWorkspaceIdForRun, workspaceDeletionRunFilter, workspaceRemovalConfirmation } from "../workspaceDeletion";
+import { isAuthRequiredError } from "../api/http";
 import "./MachineList";
 import "./ProjectList";
 import "./WorkspaceList";
@@ -143,6 +144,7 @@ export class PiWebApp extends LitElement {
         this.notifyAssistantOutputSnapshot(machineId, session.id);
       },
       onAppliedSessionEvent: (event) => { this.notifyAssistantOutputEvent(event); },
+      onAuthenticationRequired: () => { this.enterAuthenticationRequired(); },
       replacePromptEditorText: async ({ machineId, sessionId, text }) => {
         await this.updateComplete;
         if (selectedMachineId(this.state) !== machineId || this.state.selectedSession?.id !== sessionId) return;
@@ -199,14 +201,28 @@ export class PiWebApp extends LitElement {
     probe: async () => (await machinesApi.health(selectedMachineId(this.state))).ok,
     refresh: () => this.refreshAfterBrowserResume(),
     onStateChange: (recovering) => { this.reconnectingAfterResume = recovering; },
-    onProbeError: () => undefined,
+    onProbeError: (error) => {
+      if (isAuthRequiredError(error)) this.enterAuthenticationRequired();
+    },
   });
   private readonly browserResume = new BrowserResumeController({
     onResumeSignal: () => { this.handleBrowserResumeSignal(); },
-    onNetworkOnline: () => { this.browserConnectionRecovery.start(); },
-    onStaleResume: () => { this.browserConnectionRecovery.start(); },
+    onNetworkOnline: () => {
+      if (this.authenticationRequired) return;
+      this.browserConnectionRecovery.start();
+    },
+    onStaleResume: () => {
+      if (this.authenticationRequired) return;
+      this.browserConnectionRecovery.start();
+    },
     refreshAfterResume: () => this.refreshAfterBrowserResume(),
-    onRefreshError: (error) => { console.warn("Failed to refresh after browser resume", error); },
+    onRefreshError: (error) => {
+      if (isAuthRequiredError(error)) {
+        this.enterAuthenticationRequired();
+        return;
+      }
+      console.warn("Failed to refresh after browser resume", error);
+    },
   });
   private readonly panelCollapse = new PanelCollapseController(this);
   private readonly panelResize = new PanelResizeController(this);
@@ -241,6 +257,8 @@ export class PiWebApp extends LitElement {
   @state() private activeThemeId: QualifiedContributionId = CLASSIC_THEME_ID;
   @state() private isRefreshingApp = false;
   @state() private reconnectingAfterResume = false;
+  /** Proxy session expired; writes stay gated until the user reauthenticates. */
+  @state() private authenticationRequired = false;
   @state() private sessionCleanupDialog: SessionCleanupDialogState | undefined;
   @state() private settingsSection: SettingsSection | undefined = readSettingsSection();
   @state() private shortcutConfig: PiWebShortcutConfig = {};
@@ -518,6 +536,29 @@ export class PiWebApp extends LitElement {
 
   private hardReloadApp(): void {
     window.location.reload();
+  }
+
+  /**
+   * Enter the terminal proxy-auth-required state: cancel connection recovery,
+   * keep prompt writes gated, and surface a non-dismissible banner with an
+   * explicit Reauthenticate action. Never auto-navigates or retries prompts.
+   */
+  private enterAuthenticationRequired(): void {
+    if (this.authenticationRequired) return;
+    this.authenticationRequired = true;
+    this.browserConnectionRecovery.stop();
+    if (this.state.error === "") {
+      this.setState({ error: "Session expired. Sign in again to continue. Your draft was kept." });
+    }
+  }
+
+  /** User-initiated top-level navigation to the Authentik outpost start URL. */
+  private startProxyReauthentication(): void {
+    const returnUrl = validatedSameOriginReturnUrl(window.location.href, window.location.origin);
+    if (returnUrl === undefined) return;
+    const target = new URL("/outpost.goauthentik.io/start", window.location.origin);
+    target.searchParams.set("rd", returnUrl);
+    window.location.assign(target.href);
   }
 
   private async restoreRoute(updateUrl: boolean) {
@@ -2032,17 +2073,19 @@ export class PiWebApp extends LitElement {
     if (value !== "") await this.sessions.setThinkingLevel(value);
   }
 
-  private sendPrompt(text: string, streamingBehavior?: "steer" | "followUp", attachments?: import("../api").PromptAttachment[], delivery?: import("../../../shared/apiTypes").PromptAttachmentDelivery): void {
+  private async sendPrompt(text: string, streamingBehavior?: "steer" | "followUp", attachments?: import("../api").PromptAttachment[], delivery?: import("../../../shared/apiTypes").PromptAttachmentDelivery): Promise<PromptDeliveryResult> {
     const hasAttachments = attachments !== undefined && attachments.length > 0;
-    if (!hasAttachments && streamingBehavior === undefined && this.auth.handleSlashCommand(text)) return;
-    void this.sessions.send(text, streamingBehavior, attachments, delivery);
+    if (!hasAttachments && streamingBehavior === undefined && this.auth.handleSlashCommand(text)) {
+      return { ok: true, kind: "local-command" };
+    }
+    return this.sessions.send(text, streamingBehavior, attachments, delivery);
   }
 
   // Stable handler identities for child components. Inlined arrow closures
   // would be a fresh reference on every render, forcing Lit to re-commit the
   // bindings each time the app re-renders; bound class fields keep them constant.
-  private readonly handleSendPrompt = (text: string, streamingBehavior?: "steer" | "followUp", attachments?: import("../api").PromptAttachment[], delivery?: import("../../../shared/apiTypes").PromptAttachmentDelivery): void => {
-    this.sendPrompt(text, streamingBehavior, attachments, delivery);
+  private readonly handleSendPrompt = (text: string, streamingBehavior?: "steer" | "followUp", attachments?: import("../api").PromptAttachment[], delivery?: import("../../../shared/apiTypes").PromptAttachmentDelivery): Promise<PromptDeliveryResult> => {
+    return this.sendPrompt(text, streamingBehavior, attachments, delivery);
   };
 
   private readonly handleStopActiveWork = (): void => {
@@ -2165,12 +2208,20 @@ export class PiWebApp extends LitElement {
         <main class=${mainViewClass(state.mainView)}>
           ${this.renderContextBar()}
           ${this.renderMobileMainTabs()}
-          ${errorBanner(state.error, () => { this.setState({ error: "" }); })}
+          ${errorBanner(
+            state.error,
+            // Auth-required banners are non-dismissible so Reauthenticate stays
+            // available while writes remain gated. Ordinary errors stay dismissible.
+            this.authenticationRequired ? undefined : () => { this.setState({ error: "" }); },
+            this.authenticationRequired
+              ? { label: "Reauthenticate", onClick: () => { this.startProxyReauthentication(); } }
+              : undefined,
+          )}
           ${deprecatedAgentInputsBanner(deprecatedAgentInputsWarnings(state.machines, state.machineRuntimes))}
           <div class="mobile-navigation-panel">${this.appShell.isMobileNavigationLayout ? this.renderNavigationPanel() : null}</div>
           ${state.selectedSession ? html`
             ${this.renderChatView(state, state.selectedSession)}
-            <prompt-editor .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .disabled=${state.selectedSession.archived === true} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .reconnecting=${this.reconnectingAfterResume} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
+            <prompt-editor .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .disabled=${state.selectedSession.archived === true} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .reconnecting=${this.reconnectingAfterResume} .authenticationRequired=${this.authenticationRequired} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
             ${this.renderStatusBar(state)}
             ${state.commandDialog !== undefined ? html`<command-picker .title=${state.commandDialog.title} .options=${state.commandDialog.options} .onPick=${(value: string) => this.sessions.respondToCommand(state.commandDialog?.requestId ?? "", value)} .onCancel=${() => { this.sessions.cancelCommand(); }}></command-picker>` : null}
             ${state.modelDialog !== undefined ? html`<command-picker title=${state.modelDialog.title} .searchable=${true} .options=${state.modelDialog.options} .selectedValue=${state.modelDialog.selectedValue} .onPick=${(value: string) => { void this.pickModel(value); }} .onCancel=${() => { this.setState({ modelDialog: undefined }); }}></command-picker>` : null}
@@ -2271,6 +2322,23 @@ function remoteRouteRestoreRetryDelay(attempt: number): number {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Same-origin return URL suitable for Authentik `rd`.
+ * Returns only validated origin + pathname — never query or fragment — so
+ * workspace/session/file/plugin route state and other secrets are not forwarded
+ * to the auth provider. Rejects cross-origin or credentialed URLs.
+ */
+export function validatedSameOriginReturnUrl(href: string, origin: string): string | undefined {
+  try {
+    const url = new URL(href);
+    if (url.origin !== origin) return undefined;
+    if (url.username !== "" || url.password !== "") return undefined;
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return undefined;
+  }
 }
 
 function omitWorkspaceDeletionRun(runs: Record<string, TerminalCommandRun>, workspaceId: string): Record<string, TerminalCommandRun> {

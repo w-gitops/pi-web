@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { AuthRequiredError } from "../api/http";
 import { initialAppState } from "../appState";
 import { SessionController } from "./sessionController";
 import { defaultApi, deferred, emptyPage, FakeSocket, oldSession, replacementSession, sessionLookupId, status, workspace, type AppState, type Deferred, type PromptAttachment, type SessionInfo } from "./sessionController.testSupport";
@@ -16,11 +17,182 @@ describe("SessionController send queue", () => {
       { api: { ...defaultApi, prompt }, socket },
     );
 
-    await controller.send("do this once");
+    const result = await controller.send("do this once");
 
+    expect(result).toEqual({ ok: false, kind: "delivery-unknown" });
     expect(prompt).toHaveBeenCalledOnce();
     expect(socket.reconnectCalls).toBe(1);
     expect(state.error).toBe("Prompt delivery may be unknown because the connection failed. TypeError: Load failed");
+  });
+
+  it("returns auth-required without retrying and notifies the app once", async () => {
+    let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession] };
+    const prompt = vi.fn(() => Promise.reject(new AuthRequiredError()));
+    const onAuthenticationRequired = vi.fn();
+    const socket = new FakeSocket();
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      undefined,
+      { api: { ...defaultApi, prompt }, socket, onAuthenticationRequired },
+    );
+
+    const result = await controller.send("do this once");
+
+    expect(result).toEqual({ ok: false, kind: "auth-required" });
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(socket.reconnectCalls).toBe(0);
+    expect(onAuthenticationRequired).toHaveBeenCalledOnce();
+    expect(state.error).toContain("Sign in again");
+    expect(state.error).toContain("may already have been sent");
+    expect(state.error).not.toContain("outpost.goauthentik.io");
+    expect(state.error).not.toContain("secret");
+  });
+
+  it("returns auth-required from slash-command sends and notifies without retrying", async () => {
+    let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession] };
+    const runCommand = vi.fn(() => Promise.reject(new AuthRequiredError()));
+    const onAuthenticationRequired = vi.fn();
+    const socket = new FakeSocket();
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      undefined,
+      { api: { ...defaultApi, runCommand }, socket, onAuthenticationRequired },
+    );
+
+    const result = await controller.send("/help");
+
+    expect(result).toEqual({ ok: false, kind: "auth-required" });
+    expect(runCommand).toHaveBeenCalledOnce();
+    expect(socket.reconnectCalls).toBe(0);
+    expect(onAuthenticationRequired).toHaveBeenCalledOnce();
+    expect(state.error).toContain("Sign in again");
+  });
+
+  it("returns auth-required from shell sends and notifies without retrying", async () => {
+    let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession] };
+    const shell = vi.fn(() => Promise.reject(new AuthRequiredError()));
+    const onAuthenticationRequired = vi.fn();
+    const socket = new FakeSocket();
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      undefined,
+      { api: { ...defaultApi, shell }, socket, onAuthenticationRequired },
+    );
+
+    const result = await controller.send("!pwd");
+
+    expect(result).toEqual({ ok: false, kind: "auth-required" });
+    expect(shell).toHaveBeenCalledOnce();
+    expect(socket.reconnectCalls).toBe(0);
+    expect(onAuthenticationRequired).toHaveBeenCalledOnce();
+    expect(state.error).toContain("Sign in again");
+  });
+
+  it("stops queued slash-command flush on auth and does not continue the queue", async () => {
+    const started: SessionInfo = { ...oldSession, id: "started-session", path: "/tmp/started-session.jsonl" };
+    const startRequest = deferred<SessionInfo>();
+    const runCommand = vi.fn(() => Promise.reject(new AuthRequiredError()));
+    const prompt = vi.fn(() => Promise.resolve({ accepted: true as const }));
+    const onAuthenticationRequired = vi.fn();
+    let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, sessions: [] };
+    const api: typeof defaultApi = {
+      ...defaultApi,
+      startSession: () => startRequest.promise,
+      messages: () => Promise.resolve(emptyPage),
+      status: (session) => Promise.resolve(status(sessionLookupId(session))),
+      runCommand,
+      prompt,
+    };
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      undefined,
+      { api, socket: new FakeSocket(), onAuthenticationRequired },
+    );
+
+    const start = controller.startSession();
+    await controller.send("/help");
+    await controller.send("after-auth");
+
+    startRequest.resolve(started);
+    await start;
+
+    expect(runCommand).toHaveBeenCalledOnce();
+    expect(prompt).not.toHaveBeenCalled();
+    expect(onAuthenticationRequired).toHaveBeenCalledOnce();
+    expect(state.clientQueuedSessionMessages[started.id]).toEqual([
+      { kind: "followUp", text: "/help" },
+      { kind: "followUp", text: "after-auth" },
+    ]);
+  });
+
+  it("stops queued background flush on auth without retrying later prompts", async () => {
+    const started: SessionInfo = { ...oldSession, id: "started-session", path: "/tmp/started-session.jsonl" };
+    const startRequest = deferred<SessionInfo>();
+    const prompt = vi.fn(() => Promise.reject(new AuthRequiredError()));
+    const onAuthenticationRequired = vi.fn();
+    let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, sessions: [] };
+    const api: typeof defaultApi = {
+      ...defaultApi,
+      startSession: () => startRequest.promise,
+      messages: () => Promise.resolve(emptyPage),
+      status: (session) => Promise.resolve(status(sessionLookupId(session))),
+      prompt,
+    };
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      undefined,
+      { api, socket: new FakeSocket(), onAuthenticationRequired },
+    );
+
+    const start = controller.startSession();
+    const temporaryId = state.selectedSession?.id;
+    if (temporaryId === undefined) throw new Error("Expected temporary session id");
+    await controller.send("first");
+    await controller.send("second");
+
+    startRequest.resolve(started);
+    await start;
+
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(onAuthenticationRequired).toHaveBeenCalledOnce();
+    expect(state.error).toContain("Sign in again");
+    // First queued item failed auth without being dropped; later items are not retried.
+    expect(state.clientQueuedSessionMessages[temporaryId]).toBeUndefined();
+    expect(state.clientQueuedSessionMessages[started.id]).toEqual([
+      { kind: "followUp", text: "first" },
+      { kind: "followUp", text: "second" },
+    ]);
+  });
+
+  it("keeps transport TypeError as delivery-unknown (auth only via explicit AuthRequiredError)", async () => {
+    let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession] };
+    const prompt = vi.fn(() => Promise.reject(new TypeError("Load failed")));
+    const onAuthenticationRequired = vi.fn();
+    const socket = new FakeSocket();
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      undefined,
+      { api: { ...defaultApi, prompt }, socket, onAuthenticationRequired },
+    );
+
+    const result = await controller.send("maybe sent");
+
+    expect(result).toEqual({ ok: false, kind: "delivery-unknown" });
+    expect(onAuthenticationRequired).not.toHaveBeenCalled();
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(socket.reconnectCalls).toBe(1);
   });
 
   it("does not clear an existing global warning after a successful prompt", async () => {
