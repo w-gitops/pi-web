@@ -4,6 +4,7 @@ import {
   defaultNavigationSection,
   expandedNavigationSection,
   INITIAL_DESKTOP_COLLAPSED_NAVIGATION_SECTIONS,
+  INITIAL_MOBILE_EXPANDED_NAVIGATION_SECTION,
   isNavigationSectionCollapsed,
   NavigationSectionsController,
   toggleCollapsedNavigationSection,
@@ -88,7 +89,9 @@ describe("navigationState", () => {
     expect(controller.isCollapsed("workspaces")).toBe(true);
   });
 
-  it("keeps the mobile accordion independent of the desktop start-collapsed list", () => {
+  it("starts the mobile accordion with Projects and Workspaces collapsed", () => {
+    expect(INITIAL_MOBILE_EXPANDED_NAVIGATION_SECTION).toBe("none");
+
     const nothingSelected = createNavigationSectionsController({
       selectedProject: undefined,
       selectedWorkspace: undefined,
@@ -100,11 +103,26 @@ describe("navigationState", () => {
       isMobileLayout: true,
     });
 
-    expect(nothingSelected.isCollapsed("projects")).toBe(false);
+    expect(nothingSelected.isCollapsed("projects")).toBe(true);
     expect(nothingSelected.isCollapsed("workspaces")).toBe(true);
+    expect(nothingSelected.isCollapsed("sessions")).toBe(true);
     expect(bothSelected.isCollapsed("projects")).toBe(true);
     expect(bothSelected.isCollapsed("workspaces")).toBe(true);
-    expect(bothSelected.isCollapsed("sessions")).toBe(false);
+    expect(bothSelected.isCollapsed("sessions")).toBe(true);
+  });
+
+  it("lets a mobile user open one accordion section after load", () => {
+    const controller = createNavigationSectionsController({
+      selectedProject: undefined,
+      selectedWorkspace: undefined,
+      isMobileLayout: true,
+    });
+
+    controller.toggle("projects");
+
+    expect(controller.isCollapsed("projects")).toBe(false);
+    expect(controller.isCollapsed("workspaces")).toBe(true);
+    expect(controller.isCollapsed("sessions")).toBe(true);
   });
 });
 

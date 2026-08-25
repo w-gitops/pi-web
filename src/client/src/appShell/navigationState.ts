@@ -4,8 +4,11 @@ export const NAVIGATION_SECTION_ORDER = ["machines", "projects", "workspaces", "
 export type NavigationSection = (typeof NAVIGATION_SECTION_ORDER)[number];
 export type ExpandedNavigationSection = NavigationSection | "none" | undefined;
 
-/** Desktop sections that start collapsed on every page load. Mobile still uses the accordion. */
+/** Desktop sections that start collapsed on every page load. */
 export const INITIAL_DESKTOP_COLLAPSED_NAVIGATION_SECTIONS = ["projects", "workspaces"] as const satisfies readonly NavigationSection[];
+
+/** Mobile accordion starts with every section closed so Projects/Workspaces do not auto-open after login. */
+export const INITIAL_MOBILE_EXPANDED_NAVIGATION_SECTION: ExpandedNavigationSection = "none";
 
 export interface NavigationSelectionState {
   selectedProject: object | undefined;
@@ -49,7 +52,7 @@ export function nextNavigationSection(section: NavigationSection): NavigationSec
 }
 
 export class NavigationSectionsController implements ReactiveController {
-  private expanded: ExpandedNavigationSection;
+  private expanded: ExpandedNavigationSection = INITIAL_MOBILE_EXPANDED_NAVIGATION_SECTION;
   private collapsedSections: readonly NavigationSection[] = [...INITIAL_DESKTOP_COLLAPSED_NAVIGATION_SECTIONS];
 
   hostConnected(): void {
