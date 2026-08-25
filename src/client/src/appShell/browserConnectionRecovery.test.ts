@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { AuthRequiredError } from "../api/http";
 import { BrowserConnectionRecovery } from "./browserConnectionRecovery";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -81,5 +82,70 @@ describe("BrowserConnectionRecovery", () => {
 
     expect(recovery.isRecovering()).toBe(false);
     expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("treats AuthRequiredError as terminal for the current generation without further probes", async () => {
+    const sleeps: number[] = [];
+    const probe = vi.fn(() => Promise.reject(new AuthRequiredError()));
+    const reconnectTransports = vi.fn();
+    const refresh = vi.fn();
+    const onProbeError = vi.fn();
+    const recovery = new BrowserConnectionRecovery({
+      reconnectTransports,
+      probe,
+      refresh,
+      onStateChange: () => undefined,
+      onProbeError,
+    }, {
+      retryDelaysMs: [0, 25, 50],
+      sleep: (delayMs) => { sleeps.push(delayMs); return Promise.resolve(); },
+    });
+
+    recovery.start();
+    await vi.waitFor(() => { expect(onProbeError).toHaveBeenCalledOnce(); });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(probe).toHaveBeenCalledOnce();
+    expect(reconnectTransports).toHaveBeenCalledOnce();
+    expect(refresh).not.toHaveBeenCalled();
+    expect(recovery.isRecovering()).toBe(true);
+    expect(sleeps).toEqual([0]);
+    expect(onProbeError.mock.calls[0]?.[0]).toBeInstanceOf(AuthRequiredError);
+
+    // A later start() is required; the abandoned generation must not keep probing.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(probe).toHaveBeenCalledOnce();
+    expect(sleeps).toEqual([0]);
+  });
+
+  it("keeps recovery gated after auth failure during refresh and schedules no further probes", async () => {
+    const sleeps: number[] = [];
+    const probe = vi.fn(() => Promise.resolve(true));
+    const reconnectTransports = vi.fn();
+    const refresh = vi.fn(() => Promise.reject(new AuthRequiredError()));
+    const onProbeError = vi.fn();
+    const recovery = new BrowserConnectionRecovery({
+      reconnectTransports,
+      probe,
+      refresh,
+      onStateChange: () => undefined,
+      onProbeError,
+    }, {
+      retryDelaysMs: [0, 25],
+      sleep: (delayMs) => { sleeps.push(delayMs); return Promise.resolve(); },
+    });
+
+    recovery.start();
+    await vi.waitFor(() => { expect(onProbeError).toHaveBeenCalledOnce(); });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(probe).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(recovery.isRecovering()).toBe(true);
+    expect(sleeps).toEqual([0]);
+    expect(onProbeError.mock.calls[0]?.[0]).toBeInstanceOf(AuthRequiredError);
   });
 });

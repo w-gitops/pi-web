@@ -12,6 +12,37 @@ const DEFAULT_API_REQUEST_TELEMETRY: ApiRequestTelemetry = {
   finish: finishApiTelemetry,
 };
 
+const AUTHENTIK_OUTPOST_PREFIX = "/outpost.goauthentik.io";
+const REAUTH_HEADER = "x-pi-web-reauth";
+
+/**
+ * Proxy authentication has expired or is missing. Carries no response bodies,
+ * URLs, prompt text, or credentials — only a stable, user-safe message.
+ */
+export class AuthRequiredError extends Error {
+  override readonly name = "AuthRequiredError";
+
+  constructor(message = "Authentication required") {
+    super(message);
+  }
+}
+
+export function isAuthRequiredError(error: unknown): error is AuthRequiredError {
+  return error instanceof AuthRequiredError;
+}
+
+/**
+ * True when the response explicitly signals proxy re-authentication is required
+ * (same-origin 401 with X-PI-Web-Reauth: 1, or a followed Authentik outpost URL).
+ * Fetch transport failures (TypeError / "Load failed") never produce a Response
+ * and must not be classified as auth here — callers treat those as delivery-unknown
+ * and may later confirm auth via a safe same-origin health probe.
+ */
+export function isProxyAuthRequiredResponse(response: Response): boolean {
+  if (response.headers.get(REAUTH_HEADER) === "1") return true;
+  return isAuthentikOutpostFinalUrl(response.url);
+}
+
 export async function request<T>(url: string, parse: (value: unknown) => T, init?: RequestInit, operation: ApiTelemetryOperation = "api.unknown"): Promise<T> {
   return apiRequest(url, operation, init, async (response) => {
     if (!response.ok) {
@@ -37,12 +68,23 @@ export async function apiRequest<T>(
   let response: Response | undefined;
   try {
     response = await fetch(resolveAppUrl(url), { ...init, headers });
+    if (isProxyAuthRequiredResponse(response)) throw new AuthRequiredError();
     const value = await handle(response);
     telemetry.finish(observation, response.ok ? "success" : httpOutcome(response.status), response.status);
     return value;
   } catch (error) {
     telemetry.finish(observation, response === undefined ? transportOutcome(init?.signal) : response.ok ? "parse" : httpOutcome(response.status), response?.status);
     throw error;
+  }
+}
+
+function isAuthentikOutpostFinalUrl(urlString: string): boolean {
+  if (urlString === "") return false;
+  try {
+    const pathname = new URL(urlString).pathname;
+    return pathname === AUTHENTIK_OUTPOST_PREFIX || pathname.startsWith(`${AUTHENTIK_OUTPOST_PREFIX}/`);
+  } catch {
+    return false;
   }
 }
 

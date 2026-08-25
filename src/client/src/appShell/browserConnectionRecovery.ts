@@ -1,3 +1,5 @@
+import { isAuthRequiredError } from "../api/http";
+
 export interface BrowserConnectionRecoveryCallbacks {
   reconnectTransports(): void;
   probe(): Promise<boolean>;
@@ -55,6 +57,12 @@ export class BrowserConnectionRecovery {
         }
       } catch (error) {
         this.callbacks.onProbeError(error);
+        // Proxy auth expiry is terminal for this generation: keep writes gated and
+        // stop scheduling further probes/socket reconnects until a later start().
+        if (isAuthRequiredError(error)) {
+          this.abandonGeneration(generation);
+          return;
+        }
         attempt += 1;
         continue;
       }
@@ -66,6 +74,11 @@ export class BrowserConnectionRecovery {
         await this.callbacks.refresh();
       } catch (error) {
         this.callbacks.onProbeError(error);
+        if (isAuthRequiredError(error)) {
+          this.setRecovering(true);
+          this.abandonGeneration(generation);
+          return;
+        }
       }
       return;
     }
@@ -75,6 +88,11 @@ export class BrowserConnectionRecovery {
     if (this.recovering === recovering) return;
     this.recovering = recovering;
     this.callbacks.onStateChange(recovering);
+  }
+
+  /** Invalidate `generation` without clearing the recovering gate. */
+  private abandonGeneration(generation: number): void {
+    if (this.generation === generation) this.generation += 1;
   }
 }
 

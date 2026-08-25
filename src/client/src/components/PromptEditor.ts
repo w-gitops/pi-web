@@ -3,10 +3,11 @@ import { markdown, deleteMarkupBackward, insertNewlineContinueMarkup } from "@co
 import { EditorSelection, EditorState, Compartment } from "@codemirror/state";
 import { EditorView, keymap, placeholder } from "@codemirror/view";
 import { defaultHighlightStyle, indentOnInput, indentUnit, syntaxHighlighting } from "@codemirror/language";
-import { LitElement, html, type PropertyValues } from "lit";
+import { LitElement, css, html, type PropertyValues } from "lit";
 import { customElement, property, query, state } from "lit/decorators.js";
 import { api, type FileSuggestion, type PromptAttachment, type SessionModel, type SessionStatus, type SlashCommand } from "../api";
 import type { PromptAttachmentDelivery } from "../../../shared/apiTypes";
+import type { PromptDeliveryResult } from "../controllers/sessionController";
 import { capturePromptAttachments, effectivePromptAttachmentDelivery, isInlinePromptAttachment, promptAttachmentsCanUseInlineDelivery, type CapturedAttachment } from "../promptAttachmentCapture";
 import { inputModeForDraft, inputModesEqual, type InputMode } from "../inputModes";
 import { machineSessionKey } from "../machineKeys";
@@ -20,6 +21,16 @@ import { thinkingGauge, thinkingLevelLabel } from "../../../shared/thinkingLevel
 import "./AutocompleteMenu";
 
 type PendingAttachment = CapturedAttachment & { id: string };
+
+/** Per-composer ephemeral state kept across machine/session switches in memory. */
+interface ComposerSessionMemory {
+  attachments: PendingAttachment[];
+  deliveryWarning: string | undefined;
+  attachmentError: string | undefined;
+}
+
+const DELIVERY_AMBIGUOUS_WARNING = "Delivery may already have been sent — verify the transcript before sending again.";
+const DELIVERY_AUTH_WARNING = "Session expired. Sign in again, then verify the transcript before sending again — it may already have been sent.";
 
 @customElement("prompt-editor")
 export class PromptEditor extends LitElement {
@@ -35,7 +46,9 @@ export class PromptEditor extends LitElement {
   @property({ attribute: false }) status?: SessionStatus;
   @property({ type: Boolean }) sending = false;
   @property({ type: Boolean }) reconnecting = false;
-  @property({ attribute: false }) onSend?: (text: string, streamingBehavior?: "steer" | "followUp", attachments?: PromptAttachment[], delivery?: PromptAttachmentDelivery) => void | Promise<void>;
+  /** Proxy session expired; send stays blocked until the user reauthenticates. */
+  @property({ type: Boolean }) authenticationRequired = false;
+  @property({ attribute: false }) onSend?: (text: string, streamingBehavior?: "steer" | "followUp", attachments?: PromptAttachment[], delivery?: PromptAttachmentDelivery) => PromptDeliveryResult | Promise<PromptDeliveryResult>;
   @property({ attribute: false }) onStop?: () => void;
   @property({ attribute: false }) onSelectModel?: () => void;
   @property({ attribute: false }) onSelectThinking?: () => void;
@@ -55,6 +68,9 @@ export class PromptEditor extends LitElement {
   @state() private attachments: PendingAttachment[] = [];
   @state() private attachmentDelivery: PromptAttachmentDelivery = loadAttachmentDelivery();
   @state() private attachmentError: string | undefined = undefined;
+  /** Local in-flight guard so plain-text sends cannot clear or double-submit before delivery is known. */
+  @state() private submitting = false;
+  @state() private deliveryWarning: string | undefined = undefined;
   private attachmentSeq = 0;
   private requestVersion = 0;
   private editor: EditorView | undefined;
@@ -62,18 +78,35 @@ export class PromptEditor extends LitElement {
   private readonly readOnlyCompartment = new Compartment();
   private readonly mobilePromptEnterMedia = createMobilePromptEnterMedia();
   private explicitShiftKeyActive = false;
+  /** In-memory composer extras keyed by machine/session; drafts also live in storage. */
+  private readonly composerMemory = new Map<string, ComposerSessionMemory>();
+  /** Composer identity that currently owns an in-flight send, if any. */
+  private inFlightComposerKey: string | undefined;
 
   protected override willUpdate(changed: PropertyValues<this>) {
     if (!changed.has("sessionId") && !changed.has("machineId")) return;
     const previousSessionId = changed.has("sessionId") ? changed.get("sessionId") : this.sessionId;
     const previousMachineId = changed.has("machineId") ? changed.get("machineId") : this.machineId;
     const previousKey = draftStorageKey(previousMachineId, previousSessionId);
-    if (previousKey !== undefined) saveDraft(previousKey, this.draft);
+    if (previousKey !== undefined) {
+      saveDraft(previousKey, this.draft);
+      this.composerMemory.set(previousKey, {
+        attachments: this.attachments,
+        deliveryWarning: this.deliveryWarning,
+        attachmentError: this.attachmentError,
+      });
+    }
     const currentKey = draftStorageKey(this.machineId, this.sessionId);
     this.draft = currentKey !== undefined ? loadDraft(currentKey) : "";
+    const memory = currentKey !== undefined ? this.composerMemory.get(currentKey) : undefined;
+    this.attachments = memory?.attachments ?? [];
+    this.deliveryWarning = memory?.deliveryWarning;
+    this.attachmentError = memory?.attachmentError;
     this.currentInputMode = inputModeForDraft(this.draft);
     this.completions = [];
     this.selectedIndex = 0;
+    // Only the originating composer stays locked while its send is in flight.
+    this.submitting = currentKey !== undefined && currentKey === this.inFlightComposerKey;
   }
 
   protected override shouldUpdate(changed: PropertyValues<this>): boolean {
@@ -92,7 +125,7 @@ export class PromptEditor extends LitElement {
   }
 
   protected override updated(changed: PropertyValues) {
-    if (changed.has("disabled")) this.updateEditorDisabledState();
+    if (changed.has("disabled") || changed.has("submitting")) this.updateEditorDisabledState();
     if (changed.has("sessionId") || changed.has("machineId")) this.syncEditorDoc();
   }
 
@@ -106,23 +139,46 @@ export class PromptEditor extends LitElement {
     const shellInputMode = this.currentInputMode.kind === "shell" ? this.currentInputMode : undefined;
     const shellMode = shellInputMode !== undefined;
     const queuesInput = this.canSteer || this.isCompacting;
-    const busy = this.disabled || this.sending || this.reconnecting;
+    const writeGated = this.reconnecting || this.authenticationRequired;
+    const busy = this.disabled || this.sending || writeGated || this.submitting;
+    const editorLocked = this.disabled || this.submitting;
+    const sendTitle = this.authenticationRequired
+      ? "Sign in again before sending"
+      : this.reconnecting
+        ? "Waiting for the connection to recover"
+        : this.submitting
+          ? "Waiting for delivery confirmation"
+          : queuesInput
+            ? "Queue until the current activity finishes"
+            : "Send message";
+    const sendLabel = this.authenticationRequired
+      ? "Authentication required"
+      : this.reconnecting
+        ? "Reconnecting"
+        : this.submitting
+          ? "Sending"
+          : queuesInput
+            ? "Queue message"
+            : "Send message";
     return html`
       <footer class=${shellMode ? "shell-mode" : ""} @paste=${(event: ClipboardEvent) => { void this.handlePaste(event); }} @dragover=${(event: DragEvent) => { this.handleDragOver(event); }} @drop=${(event: DragEvent) => { void this.handleDrop(event); }}>
         <div class="editor-wrap">
-          <div class=${`markdown-editor${this.disabled ? " markdown-editor-disabled" : ""}`} aria-label="Message pi" aria-disabled=${this.disabled ? "true" : "false"}></div>
+          <div class=${`markdown-editor${editorLocked ? " markdown-editor-disabled" : ""}`} aria-label="Message pi" aria-disabled=${editorLocked ? "true" : "false"}></div>
           <input class="attachment-input" type="file" multiple hidden @change=${(event: Event) => { void this.handleFileInput(event); }} />
           <button class="editor-attach icon-button" ?disabled=${busy} title="Attach files" aria-label="Attach files" @click=${() => { this.attachmentInput?.click(); }}>${renderAttachIcon()}</button>
           ${shellMode ? html`<div class="mode-hint">Shell command${shellInputMode.excludeFromContext ? " · excluded from context" : ""}</div>` : null}
-          ${this.reconnecting ? html`<div class="mode-hint">Reconnecting…</div>` : null}
-          ${this.isCompacting && !shellMode && !this.reconnecting ? html`<div class="mode-hint">Compacting history · message will be queued</div>` : null}
+          ${this.authenticationRequired ? html`<div class="mode-hint">Session expired · sign in again</div>` : null}
+          ${this.reconnecting && !this.authenticationRequired ? html`<div class="mode-hint">Reconnecting…</div>` : null}
+          ${this.submitting && !writeGated ? html`<div class="mode-hint">Sending…</div>` : null}
+          ${this.isCompacting && !shellMode && !writeGated && !this.submitting ? html`<div class="mode-hint">Compacting history · message will be queued</div>` : null}
+          ${this.deliveryWarning !== undefined ? html`<div class="delivery-warning" role="status">${this.deliveryWarning}</div>` : null}
           ${this.renderAttachments()}
           <autocomplete-menu .items=${this.completions} .selectedIndex=${this.selectedIndex} .onPick=${(item: CompletionItem) => { this.pick(item); }}></autocomplete-menu>
         </div>
         <div class="actions">
           ${this.renderCompactStatus()}
-          <button class="icon-button send-button" ?disabled=${busy} title=${this.reconnecting ? "Waiting for the connection to recover" : queuesInput ? "Queue until the current activity finishes" : "Send message"} aria-label=${this.reconnecting ? "Reconnecting" : queuesInput ? "Queue message" : "Send message"} @click=${() => { this.send("followUp"); }}>${queuesInput ? renderQueueIcon() : renderSendIcon()}</button>
-          ${this.canSteer && !this.isCompacting ? html`<button class="icon-button steer-button" ?disabled=${busy} title="Steer the current response before the next model call" aria-label="Steer current response" @click=${() => { this.send("steer"); }}>${renderSteerIcon()}</button>` : null}
+          <button class="icon-button send-button" ?disabled=${busy} title=${sendTitle} aria-label=${sendLabel} @click=${() => { void this.send("followUp"); }}>${queuesInput ? renderQueueIcon() : renderSendIcon()}</button>
+          ${this.canSteer && !this.isCompacting ? html`<button class="icon-button steer-button" ?disabled=${busy} title="Steer the current response before the next model call" aria-label="Steer current response" @click=${() => { void this.send("steer"); }}>${renderSteerIcon()}</button>` : null}
           <button class="icon-button stop-button" ?disabled=${this.disabled || !this.canStop} title=${this.canStop ? "Stop current work and clear queued messages" : "Nothing running"} aria-label="Stop current work" @click=${() => this.onStop?.()}>${renderStopIcon()}</button>
         </div>
       </footer>
@@ -220,10 +276,16 @@ export class PromptEditor extends LitElement {
   }
 
   private removeAttachment(id: string) {
+    if (this.submitting) return;
     this.attachments = this.attachments.filter((attachment) => attachment.id !== id);
   }
 
+  private writesBlocked(): boolean {
+    return this.submitting || this.disabled || this.reconnecting || this.authenticationRequired;
+  }
+
   private async handlePaste(event: ClipboardEvent) {
+    if (this.writesBlocked()) return;
     const files = filesFromDataTransfer(event.clipboardData);
     if (files.length === 0) return;
     event.preventDefault();
@@ -231,11 +293,13 @@ export class PromptEditor extends LitElement {
   }
 
   private handleDragOver(event: DragEvent) {
+    if (this.writesBlocked()) return;
     if (event.dataTransfer === null) return;
     if (dataTransferHasFiles(event.dataTransfer)) event.preventDefault();
   }
 
   private async handleDrop(event: DragEvent) {
+    if (this.writesBlocked()) return;
     const files = filesFromDataTransfer(event.dataTransfer);
     if (files.length === 0) return;
     event.preventDefault();
@@ -243,6 +307,7 @@ export class PromptEditor extends LitElement {
   }
 
   private async handleFileInput(event: Event) {
+    if (this.writesBlocked()) return;
     if (!(event.target instanceof HTMLInputElement) || event.target.files === null) return;
     const files = Array.from(event.target.files);
     event.target.value = "";
@@ -250,6 +315,7 @@ export class PromptEditor extends LitElement {
   }
 
   private async addAttachmentFiles(files: File[]) {
+    if (this.writesBlocked()) return;
     this.attachmentError = undefined;
     const { attachments, error } = await capturePromptAttachments(files, readFileAsBase64);
     if (attachments.length > 0) {
@@ -285,8 +351,8 @@ export class PromptEditor extends LitElement {
             blur: () => this.resetEditorModifierState(),
           }),
           placeholder("Message pi... Use / for commands, @ for tracked files, @ space for all files, # for models"),
-          this.editableCompartment.of(EditorView.editable.of(!this.disabled)),
-          this.readOnlyCompartment.of(EditorState.readOnly.of(this.disabled)),
+          this.editableCompartment.of(EditorView.editable.of(!this.editorMutationLocked())),
+          this.readOnlyCompartment.of(EditorState.readOnly.of(this.editorMutationLocked())),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) this.updateDraft(update.state.doc.toString());
           }),
@@ -317,11 +383,16 @@ export class PromptEditor extends LitElement {
     });
   }
 
+  private editorMutationLocked(): boolean {
+    return this.disabled || this.submitting;
+  }
+
   private updateEditorDisabledState() {
+    const locked = this.editorMutationLocked();
     this.editor?.dispatch({
       effects: [
-        this.editableCompartment.reconfigure(EditorView.editable.of(!this.disabled)),
-        this.readOnlyCompartment.reconfigure(EditorState.readOnly.of(this.disabled)),
+        this.editableCompartment.reconfigure(EditorView.editable.of(!locked)),
+        this.readOnlyCompartment.reconfigure(EditorState.readOnly.of(locked)),
       ],
     });
   }
@@ -436,7 +507,7 @@ export class PromptEditor extends LitElement {
     if (!shouldSendPromptOnEnterShortcut(shiftKey, this.mobilePromptEnterMedia, readPromptEnterPreference())) {
       return insertNewlineContinueMarkup(view) || insertNewlineAndIndent(view);
     }
-    this.send(this.canSteer || this.isCompacting ? "followUp" : undefined);
+    void this.send(this.canSteer || this.isCompacting ? "followUp" : undefined);
     return true;
   }
 
@@ -468,35 +539,134 @@ export class PromptEditor extends LitElement {
     this.completions = [];
   }
 
-  private send(streamingBehavior?: "steer" | "followUp") {
-    if (this.disabled || this.sending || this.reconnecting) return;
+  private async send(streamingBehavior?: "steer" | "followUp") {
+    if (this.disabled || this.sending || this.reconnecting || this.authenticationRequired || this.submitting) return;
     const text = this.draft.trim();
     const pending = this.attachments;
     if (text === "" && pending.length === 0) return;
     const behavior = this.canSteer || this.isCompacting ? streamingBehavior : undefined;
     const attachments = pending.length > 0 ? this.currentAttachments() : undefined;
     const delivery = this.effectiveAttachmentDelivery();
-    this.resetComposer();
-    // Sending is owned by the controller (it drives the chat activity dock and,
-    // for folder mode, orchestrates the upload + reference rewrite), so this is
-    // fire-and-forget here.
-    void this.onSend?.(text, behavior, attachments, attachments === undefined ? undefined : delivery);
+    // Capture originating composer identity before await. Completion must apply
+    // only to that identity — never clear/save/filter a later selected session.
+    const originMachineId = this.machineId;
+    const originSessionId = this.sessionId;
+    const originKey = draftStorageKey(originMachineId, originSessionId);
+    const submittedDraft = this.draft;
+    const submittedAttachmentIds = new Set(pending.map((attachment) => attachment.id));
+    this.inFlightComposerKey = originKey;
+    this.submitting = true;
+    this.deliveryWarning = undefined;
+    try {
+      const result = await this.onSend?.(text, behavior, attachments, attachments === undefined ? undefined : delivery);
+      if (isPromptDeliveryFailure(result)) {
+        this.applyFailedDelivery(originMachineId, originSessionId, originKey, deliveryWarningFor(result.kind));
+        return;
+      }
+      this.applyAcceptedDelivery(originMachineId, originSessionId, originKey, submittedDraft, submittedAttachmentIds);
+    } catch {
+      this.applyFailedDelivery(originMachineId, originSessionId, originKey, DELIVERY_AMBIGUOUS_WARNING);
+    } finally {
+      if (this.inFlightComposerKey === originKey) this.inFlightComposerKey = undefined;
+      if (this.isCurrentComposer(originMachineId, originSessionId)) this.submitting = false;
+    }
   }
 
-  private resetComposer() {
-    this.draft = "";
-    this.currentInputMode = { kind: "normal" };
-    const key = draftStorageKey(this.machineId, this.sessionId);
-    if (key !== undefined) clearDraft(key);
+  private isCurrentComposer(machineId: string, sessionId: string | undefined): boolean {
+    return this.machineId === machineId && this.sessionId === sessionId;
+  }
+
+  private applyFailedDelivery(originMachineId: string, originSessionId: string | undefined, originKey: string | undefined, warning: string): void {
+    if (this.isCurrentComposer(originMachineId, originSessionId)) {
+      if (originKey !== undefined) {
+        saveDraft(originKey, this.draft);
+        this.composerMemory.set(originKey, {
+          attachments: this.attachments,
+          deliveryWarning: warning,
+          attachmentError: this.attachmentError,
+        });
+      }
+      this.deliveryWarning = warning;
+      return;
+    }
+    // Switched away: draft/attachments were snapshotted in willUpdate; only attach
+    // the failure warning to the originating composer memory.
+    if (originKey === undefined) return;
+    const memory = this.composerMemory.get(originKey) ?? {
+      attachments: [],
+      deliveryWarning: undefined,
+      attachmentError: undefined,
+    };
+    this.composerMemory.set(originKey, { ...memory, deliveryWarning: warning });
+  }
+
+  private applyAcceptedDelivery(
+    originMachineId: string,
+    originSessionId: string | undefined,
+    originKey: string | undefined,
+    submittedDraft: string,
+    submittedAttachmentIds: ReadonlySet<string>,
+  ): void {
+    if (!this.isCurrentComposer(originMachineId, originSessionId)) {
+      if (originKey !== undefined) {
+        if (loadDraft(originKey) === submittedDraft) clearDraft(originKey);
+        const memory = this.composerMemory.get(originKey);
+        const remaining = (memory?.attachments ?? []).filter((attachment) => !submittedAttachmentIds.has(attachment.id));
+        this.composerMemory.set(originKey, {
+          attachments: remaining,
+          deliveryWarning: undefined,
+          attachmentError: undefined,
+        });
+      }
+      return;
+    }
+    // Still on the originating composer: clear only the accepted snapshot.
+    if (this.draft === submittedDraft) {
+      this.draft = "";
+      this.currentInputMode = { kind: "normal" };
+      if (originKey !== undefined) clearDraft(originKey);
+      this.syncEditorDoc();
+    } else if (originKey !== undefined) {
+      saveDraft(originKey, this.draft);
+    }
     this.completions = [];
-    this.attachments = [];
+    this.attachments = this.attachments.filter((attachment) => !submittedAttachmentIds.has(attachment.id));
     this.attachmentError = undefined;
-    // `draft` is not reactive, so the cleared text will not flow to CodeMirror
-    // via `updated()`; push it to the editor document explicitly.
-    this.syncEditorDoc();
+    this.deliveryWarning = undefined;
+    if (originKey !== undefined) {
+      this.composerMemory.set(originKey, {
+        attachments: this.attachments,
+        deliveryWarning: undefined,
+        attachmentError: undefined,
+      });
+    }
   }
 
-  static override styles = promptEditorStyles;
+  static override styles = [
+    promptEditorStyles,
+    css`
+      .delivery-warning {
+        margin-top: 8px;
+        padding: 6px 10px;
+        border: 1px solid var(--pi-warning, #b45309);
+        border-radius: 8px;
+        background: color-mix(in srgb, var(--pi-warning, #b45309) 12%, transparent);
+        color: var(--pi-warning, #b45309);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+    `,
+  ];
+}
+
+function isPromptDeliveryFailure(result: PromptDeliveryResult | undefined): result is Extract<PromptDeliveryResult, { ok: false }> {
+  return result !== undefined && !result.ok;
+}
+
+function deliveryWarningFor(kind: Extract<PromptDeliveryResult, { ok: false }>["kind"]): string {
+  if (kind === "auth-required") return DELIVERY_AUTH_WARNING;
+  if (kind === "delivery-unknown") return DELIVERY_AMBIGUOUS_WARNING;
+  return "Message was not sent. Your draft and attachments were kept.";
 }
 
 // The only `status` fields the template reads directly are the model identity
