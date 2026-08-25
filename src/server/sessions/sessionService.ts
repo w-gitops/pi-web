@@ -11,6 +11,7 @@ import type {
   SessionNotificationDismissAllRequest,
   SessionNotificationDismissRequest,
   SessionNotificationInboxSnapshot,
+  SessionModelScopeMode,
   SessionUnreadAcknowledgeRequest,
   SessionUnreadCatalogSnapshot,
 } from "../../shared/apiTypes.js";
@@ -23,6 +24,7 @@ import type {
   ClientSessionCleanupExecuteResponse,
   ClientSessionCleanupPreviewResponse,
   ClientSessionModel,
+  ClientSessionModelCatalogEntry,
   ClientSessionRef,
   ClientSessionStatus,
   ClientSessionTreeForkRequest,
@@ -67,7 +69,13 @@ export interface SessionRouteService {
   cancelDialog(ref: SessionRouteRef, dialogId: string): Promise<ExtensionDialogCloseResponse>;
   dismissWarning(ref: SessionRouteRef, dismissId: string): Promise<ClientSessionStatus>;
   availableModels(ref: SessionRouteRef): Promise<ClientSessionModel[]>;
+  /** The session machine's full available-model catalog with per-model enabled state, enabled models first. */
+  modelCatalog(ref: SessionRouteRef): Promise<ClientSessionModelCatalogEntry[]>;
   setModel(ref: SessionRouteRef, provider: string, modelId: string): Promise<ClientSessionStatus>;
+  /** Add/remove one model to/from pi's enabled-models scope; returns the updated full catalog. */
+  setModelEnabled(ref: SessionRouteRef, provider: string, modelId: string, enabled: boolean): Promise<ClientSessionModelCatalogEntry[]>;
+  /** Atomically select every model or retain only the session's current model. */
+  setModelScope(ref: SessionRouteRef, mode: SessionModelScopeMode): Promise<ClientSessionModelCatalogEntry[]>;
   cycleModel(ref: SessionRouteRef, direction: "forward" | "backward"): Promise<ClientSessionStatus>;
   availableThinkingLevels(ref: SessionRouteRef): Promise<ClientThinkingLevel[]>;
   setThinkingLevel(ref: SessionRouteRef, level: string): Promise<ClientSessionStatus>;

@@ -9,8 +9,11 @@ import {
   createAgentSessionServices,
   createEditToolDefinition,
   defineTool,
+  hasTrustRequiringProjectResources,
+  ProjectTrustStore,
   readStoredCredential,
   SessionManager,
+  SettingsManager,
   type AgentSessionRuntimeDiagnostic,
   type AgentSessionServices,
   type CreateAgentSessionRuntimeFactory,
@@ -19,9 +22,12 @@ import {
   type ExtensionUIDialogOptions,
   type ExtensionUIContext,
   type ModelRuntime,
+  type ProjectTrustContext,
+  type ProjectTrustEvent,
+  type ProjectTrustEventResult,
   type ResourceDiagnostic,
 } from "@earendil-works/pi-coding-agent";
-import type { ClientArchiveSessionsResponse, ClientCommand, ClientCommandResult, ClientMessagePage, ClientSession, ClientSessionCleanupExecuteResponse, ClientSessionCleanupPreviewResponse, ClientSessionModel, ClientSessionStatus, ClientSessionTreeForkRequest, ClientSessionTreeForkResult, ClientSessionTreeNavigateRequest, ClientSessionTreeNavigateResult, ClientThinkingLevel, SessionStreamSnapshot, SessionUiEvent } from "../types.js";
+import type { ClientArchiveSessionsResponse, ClientCommand, ClientCommandResult, ClientMessagePage, ClientSession, ClientSessionCleanupExecuteResponse, ClientSessionCleanupPreviewResponse, ClientSessionModel, ClientSessionModelCatalogEntry, ClientSessionStatus, ClientSessionTreeForkRequest, ClientSessionTreeForkResult, ClientSessionTreeNavigateRequest, ClientSessionTreeNavigateResult, ClientThinkingLevel, SessionStreamSnapshot, SessionUiEvent } from "../types.js";
 import { projectBrowserMessage } from "../browserMessageProjection.js";
 import { pageMessagesAtSafeBoundary } from "./messagePaging.js";
 import type { SessionEventHub } from "../realtime/sessionEventHub.js";
@@ -54,6 +60,7 @@ import type {
   SessionNotificationDismissAllRequest,
   SessionNotificationDismissRequest,
   SessionNotificationInboxSnapshot,
+  SessionModelScopeMode,
   SessionUnreadAcknowledgeRequest,
   SessionUnreadCatalogSnapshot,
   SessionWarning,
@@ -81,6 +88,7 @@ import {
 } from "./sessionNotificationStore.js";
 import { plainTextTheme } from "./plainTextTheme.js";
 import { SessionUnreadStore, type SessionUnreadMutation } from "./sessionUnreadStore.js";
+import { applyEnabledModelToggle, catalogWithEnabledFirst, modelScopeId, persistedEnabledModelPatterns, resolveEnabledModelIds, resolveSessionModelOptions, scopedModelsFromEnabledIds, type EnabledModelCatalogEntry } from "./sessionModelScope.js";
 
 /**
  * Minimal structured-logging seam, shaped like Fastify's logger so sessiond can
@@ -325,6 +333,28 @@ interface BulkDeletePlanItem {
 
 type AgentModel = NonNullable<SpawnSessionInvocation["model"]>;
 
+type ModelScopeSource = "global" | "workspace";
+
+interface ModelScopeContext {
+  key: string;
+  source: ModelScopeSource;
+  /** Global scope controls are writable through the PI WEB picker. */
+  editable: boolean;
+}
+
+interface ModelScopeSnapshot {
+  /** Effective provider/model ids; null means every catalog model is enabled. */
+  enabledIds: readonly string[] | null;
+  /** Monotonic revision for this global or workspace scope. */
+  revision: number;
+}
+
+interface SessionModelScopeCache {
+  scopeKey: string;
+  revision: number;
+  catalogKey: string;
+}
+
 export interface PiSessionManager {
   getCwd(): string;
   getSessionId(): string;
@@ -379,17 +409,25 @@ interface PiExtensionBindings {
 export interface PiAgentSession {
   modelRuntime: ModelRuntime;
   /**
-   * Narrow read/write of the SDK `SettingsManager`, exposing only the warning
-   * suppression flags consumed here (e.g. `anthropicExtraUsage`). Used to gate
-   * the Anthropic subscription-auth billing warning the same way the TUI does,
-   * and to durably suppress it when the user dismisses the warning.
+   * Narrow read/write of the SDK `SettingsManager`, exposing the warning
+   * suppression flags consumed here (e.g. `anthropicExtraUsage`) and pi's
+   * `enabledModels` model-scope setting. The warnings gate the Anthropic
+   * subscription-auth billing warning the same way the TUI does; the enabled
+   * models let the model picker read the effective scope and edit the global
+   * scope (shared with the pi TUI) the way `showModelsSelector` does. A
+   * workspace override is exposed separately and remains read-only.
    */
   settingsManager: {
     getWarnings(): { anthropicExtraUsage?: boolean };
     setWarnings(warnings: { anthropicExtraUsage?: boolean }): void;
+    getEnabledModels(): string[] | undefined;
+    getProjectSettings?(): object;
+    setEnabledModels(patterns: string[] | undefined): void;
   };
   sessionManager: PiSessionManager;
   scopedModels: readonly { model: AgentModel; thinkingLevel?: ClientThinkingLevel }[];
+  /** Update the session's cycling scope, mirroring pi's `AgentSession.setScopedModels`. */
+  setScopedModels(models: { model: AgentModel; thinkingLevel?: ClientThinkingLevel }[]): void;
   sessionId: string;
   sessionFile: string | undefined;
   sessionName: string | undefined;
@@ -711,18 +749,190 @@ export function createPiWebCustomToolDefinitions(
 }
 
 /**
+ * Error collected from a `project_trust` handler, mirroring the per-extension
+ * errors the SDK's `emitProjectTrustEvent` returns (its `extensionPath` and
+ * `error` fields are what the reported message needs).
+ */
+export interface WebProjectTrustExtensionError {
+  extensionPath: string;
+  error: string;
+}
+
+/**
+ * The slice of the SDK's `LoadExtensionsResult` the trust event emitter reads:
+ * each pre-trust extension's path and its registered `project_trust` handlers.
+ * Narrowing keeps this module free of the SDK's full `Extension` internals; a
+ * real `LoadExtensionsResult` (as handed to the resource loader's
+ * `resolveProjectTrust` callback) is structurally assignable to it.
+ */
+export interface WebProjectTrustExtensionSet {
+  extensions: {
+    path: string;
+    handlers: Map<string, readonly ((event: ProjectTrustEvent, ctx: ProjectTrustContext) => unknown)[]>;
+  }[];
+}
+
+/**
+ * Inputs for {@link resolveWebProjectTrusted} — the web mirror of the inputs
+ * the SDK's `resolveProjectTrusted` takes.
+ */
+export interface WebProjectTrustResolution {
+  cwd: string;
+  /**
+   * The pre-trust extension set the SDK loaded for this resolution (user/global
+   * extensions; project-local ones are not loaded yet because trust is still
+   * unresolved). When present, those extensions may decide trust via the
+   * `project_trust` event.
+   */
+  extensionsResult?: WebProjectTrustExtensionSet;
+  /** The agent dir's trust store; `remember`-ed decisions are written here. */
+  trustStore: ProjectTrustStore;
+  /** Settings manager whose `defaultProjectTrust` applies when nothing decided. */
+  settingsManager: SettingsManager;
+  /**
+   * Reports a `project_trust` handler error, mirroring the SDK's
+   * `onExtensionError`.
+   */
+  onExtensionError?: (message: string) => void;
+}
+
+/**
+ * Run the `project_trust` event over a pre-trust extension set, mirroring
+ * `emitProjectTrustEvent` in the SDK's `dist/core/extensions/runner.js`. That
+ * helper is not part of the package's public exports (the main index exports
+ * only the `ProjectTrust*` types and `ProjectTrustStore`, and the package's
+ * `exports` map blocks subpath imports, so `resolveProjectTrusted`/
+ * `emitProjectTrustEvent` are not callable from here), so PI WEB reimplements
+ * its documented decision loop over the SDK-provided extension objects: per
+ * extension, the registered `project_trust` handlers run in order; the first
+ * handler returning `yes`/`no` decides and `undecided` falls through to the
+ * next handler/extension; a throwing handler is collected as an error and
+ * later handlers still get their chance.
+ */
+export async function emitWebProjectTrustEvent(
+  extensionsResult: WebProjectTrustExtensionSet,
+  event: ProjectTrustEvent,
+  ctx: ProjectTrustContext,
+): Promise<{ result?: ProjectTrustEventResult; errors: WebProjectTrustExtensionError[] }> {
+  const errors: WebProjectTrustExtensionError[] = [];
+  for (const extension of extensionsResult.extensions) {
+    // A single extension may register multiple handlers for the same event.
+    // The handlers map is keyed exactly as the extension registered it, so a
+    // `project_trust` key guarantees `ProjectTrustHandler` entries — the same
+    // assumption the SDK's emitProjectTrustEvent makes.
+    const handlers = extension.handlers.get("project_trust");
+    if (handlers === undefined || handlers.length === 0) continue;
+    for (const handler of handlers) {
+      try {
+        const handlerResult: unknown = await handler(event, ctx);
+        // The SDK reads `trusted` straight off the handler result, so a
+        // non-object would throw there; PI WEB reports it as a handler error
+        // and lets the next handler/extension try.
+        if (typeof handlerResult !== "object" || handlerResult === null) {
+          errors.push({ extensionPath: extension.path, error: "project_trust handler returned a non-object result" });
+          continue;
+        }
+        const trusted = "trusted" in handlerResult ? handlerResult.trusted : undefined;
+        if (trusted === "undecided") {
+          continue;
+        }
+        // Rebuild the decision so only the documented `trusted`/`remember`
+        // fields carry over — the SDK's resolver reads exactly those two.
+        const remember = "remember" in handlerResult ? handlerResult.remember : undefined;
+        return {
+          result: {
+            trusted: trusted === "yes" ? "yes" : "no",
+            ...(remember === true ? { remember: true } : {}),
+          },
+          errors,
+        };
+      } catch (error) {
+        errors.push({
+          extensionPath: extension.path,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+  return { errors };
+}
+
+/**
+ * PI WEB's headless project-trust context. `hasUI` is false because there is
+ * no browser trust prompt (chartered behavior: `ask` never loads untrusted
+ * resources), so the UI methods are inert — the same no-UI shape the SDK
+ * passes when pi runs without a trust UI. The host mode is `rpc`, mirroring
+ * how PI WEB binds its session extension contexts.
+ */
+function webProjectTrustContext(cwd: string): ProjectTrustContext {
+  return {
+    cwd,
+    mode: "rpc",
+    hasUI: false,
+    ui: {
+      select: () => Promise.resolve(undefined),
+      confirm: () => Promise.resolve(false),
+      input: () => Promise.resolve(undefined),
+      notify: () => undefined,
+    },
+  };
+}
+
+/**
+ * Resolve whether a workspace's project-local `.pi/` resources may load, the
+ * way `pi` resolves it — a faithful mirror of the SDK's `resolveProjectTrusted`
+ * (`dist/core/project-trust.js`, also not a public export). PI WEB has no
+ * browser trust prompt, so the precedence is, in order:
+ *
+ * 1. Nothing trust-requiring under `cwd` → trusted.
+ * 2. Pre-trust extensions (user/global — project-local ones are not loaded
+ *    yet) may decide via the `project_trust` event; `remember: true` persists
+ *    the decision to the agent dir's `trust.json`. Handler errors are reported
+ *    through {@link WebProjectTrustResolution.onExtensionError} and never
+ *    abort resolution.
+ * 3. Otherwise the saved `trust.json` decision wins.
+ * 4. Otherwise `defaultProjectTrust` decides (`always` trusts; `never`/`ask`
+ *    do not — `ask` cannot prompt in the browser, matching `pi` run without a
+ *    trust UI).
+ */
+export async function resolveWebProjectTrusted(resolution: WebProjectTrustResolution): Promise<boolean> {
+  const { cwd, trustStore, settingsManager } = resolution;
+  if (!hasTrustRequiringProjectResources(cwd)) return true;
+  if (resolution.extensionsResult) {
+    const { result, errors } = await emitWebProjectTrustEvent(
+      resolution.extensionsResult,
+      { type: "project_trust", cwd },
+      webProjectTrustContext(cwd),
+    );
+    for (const error of errors) {
+      resolution.onExtensionError?.(`Extension "${error.extensionPath}" project_trust error: ${error.error}`);
+    }
+    if (result) {
+      const trusted = result.trusted === "yes";
+      if (result.remember === true) {
+        trustStore.set(cwd, trusted);
+      }
+      return trusted;
+    }
+  }
+  const saved = trustStore.get(cwd);
+  if (saved !== null) return saved;
+  return settingsManager.getDefaultProjectTrust() === "always";
+}
+
+/**
  * Resource-loader options that append PI WEB's own system-prompt sections.
  *
  * `appendSystemPromptOverride` composes with what the loader already resolved,
  * so the operator's `SYSTEM.md` / `APPEND_SYSTEM.md` files keep their content
  * and PI WEB's sections land after them. Returns `undefined` when there is
- * nothing to add, leaving the loader exactly as pi configures it.
+ * nothing to append, leaving the loader exactly as pi configures it.
  */
 export function piWebResourceLoaderOptions(
   appendSystemPromptSections: readonly string[],
 ): CreateAgentSessionServicesOptions["resourceLoaderOptions"] | undefined {
   if (appendSystemPromptSections.length === 0) return undefined;
-  return { appendSystemPromptOverride: (base) => [...base, ...appendSystemPromptSections] };
+  return { appendSystemPromptOverride: (base: string[]) => [...base, ...appendSystemPromptSections] };
 }
 
 function createDefaultRuntimeFactory(
@@ -735,12 +945,50 @@ function createDefaultRuntimeFactory(
 ): PiWebCreateAgentSessionRuntimeFactory {
   const resourceLoaderOptions = piWebResourceLoaderOptions(appendSystemPromptSections);
   return async ({ cwd, agentDir, sessionManager, sessionStartEvent, initialModel, initialThinkingLevel, delegationToolsEnabled }) => {
+    // PI WEB always honors pi's project-trust model. When the workspace ships
+    // trust-requiring resources, trust is resolved exactly once, mirroring the
+    // SDK's flow: the resource loader first loads the pre-trust extension set
+    // (user/global; project-local ones stay out) and calls back with it, so
+    // those extensions may decide via the `project_trust` event; the resolved
+    // value then lands in the SettingsManager before any project-local
+    // resource (extensions, packages, settings, prompts) loads. With no
+    // browser trust prompt, an untrusted project's resources are skipped
+    // (matching `pi` run without a UI). Projects without trust-requiring
+    // resources skip resolution entirely and are trusted, as before.
+    const projectTrustRequiring = hasTrustRequiringProjectResources(cwd);
+    const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: !projectTrustRequiring });
+    // Pre-session-creation trust failures (`project_trust` handler errors)
+    // land in the runtime diagnostics next to the services diagnostics,
+    // exactly as the CLI appends its project-trust diagnostics.
+    const projectTrustDiagnostics: AgentSessionRuntimeDiagnostic[] = [];
     const services: AgentSessionServices = await createAgentSessionServices({
       cwd,
       agentDir,
       modelRuntime,
+      settingsManager,
       ...(resourceLoaderOptions === undefined ? {} : { resourceLoaderOptions }),
+      ...(projectTrustRequiring
+        ? {
+            resourceLoaderReloadOptions: {
+              resolveProjectTrust: async ({ extensionsResult }) =>
+                resolveWebProjectTrusted({
+                  cwd,
+                  trustStore: new ProjectTrustStore(agentDir),
+                  settingsManager,
+                  extensionsResult,
+                  onExtensionError: (message) => projectTrustDiagnostics.push({ type: "warning", message }),
+                }),
+            },
+          }
+        : {}),
     });
+    const modelOptions = await resolveSessionModelOptions({
+      services,
+      hasExistingSession: sessionManager.buildSessionContext().messages.length > 0,
+      ...(initialModel === undefined ? {} : { initialModel }),
+      ...(initialThinkingLevel === undefined ? {} : { initialThinkingLevel }),
+    });
+    services.diagnostics.push(...modelOptions.diagnostics);
     const resolvedDelegationToolsEnabled = delegationToolsEnabled
       ?? await sessionAllowsDelegationTools(sessionManager, sessionManagers);
     const customTools = createPiWebCustomToolDefinitions(cwd, resolvedDelegationToolsEnabled, spawn, subsessions, askUser);
@@ -749,10 +997,11 @@ function createDefaultRuntimeFactory(
       sessionManager,
       customTools,
       ...(sessionStartEvent === undefined ? {} : { sessionStartEvent }),
-      ...(initialModel === undefined ? {} : { model: initialModel }),
-      ...(initialThinkingLevel === undefined ? {} : { thinkingLevel: initialThinkingLevel }),
+      ...(modelOptions.model === undefined ? {} : { model: modelOptions.model }),
+      ...(modelOptions.thinkingLevel === undefined ? {} : { thinkingLevel: modelOptions.thinkingLevel }),
+      ...(modelOptions.scopedModels.length === 0 ? {} : { scopedModels: modelOptions.scopedModels }),
     });
-    return { ...result, services, diagnostics: services.diagnostics };
+    return { ...result, services, diagnostics: [...projectTrustDiagnostics, ...services.diagnostics] };
   };
 }
 
@@ -863,6 +1112,16 @@ export class PiSessionService implements SessionRouteService {
   private readonly treeNavigations = new WeakSet<PiAgentSession>();
   /** Counts async operations that may append an entry before they settle. */
   private readonly sessionEntryMutationCounts = new WeakMap<PiAgentSession, number>();
+  /** Settings-wide queue preventing enabled-model read/modify/write races across sessions. */
+  private modelScopeMutationQueue: Promise<void> = Promise.resolve();
+  /** Global and workspace-owned enabled-model states; live session scopes project one entry lazily. */
+  private readonly modelScopeStates = new Map<string, ModelScopeSnapshot>();
+  /** Coalesces initialization reads independently for the global and each workspace scope. */
+  private readonly modelScopeInitializations = new Map<string, Promise<ModelScopeSnapshot>>();
+  /** Monotonic revision published for global scope changes and consumed by clients. */
+  private modelScopeRevision = 0;
+  /** Last scope/catalog revision projected into each runtime, synchronized lazily on use. */
+  private readonly modelScopeCache = new WeakMap<PiAgentSession, SessionModelScopeCache>();
   /** Runtime/session-identity reservations for operations that must not overlap tree navigation. */
   private readonly treeExclusiveRuntimeOperationCounts = new WeakMap<PiSessionRuntime, number>();
   private readonly treeExclusiveSessionOperationCounts = new Map<string, number>();
@@ -1267,17 +1526,122 @@ export class PiSessionService implements SessionRouteService {
   }
 
   /**
-   * The models a session may pick from: its scoped set when model-scoped,
-   * otherwise the runtime's available snapshot. Refreshes the runtime catalog
-   * first so callers see newly configured providers and models. The refresh
-   * stays local (`allowNetwork: false`); network refreshes belong to the
-   * bounded background catalog refresher, not this request path.
+   * Resolve the settings domain for a session. Pi's settings manager deep-merges
+   * objects, but an `enabledModels` array in `.pi/settings.json` replaces the
+   * global array, so that workspace gets its own effective scope and is not
+   * affected by global picker edits.
+   */
+  private modelScopeContext(session: PiAgentSession): ModelScopeContext {
+    const projectSettings = session.settingsManager.getProjectSettings?.() ?? {};
+    if (!Object.hasOwn(projectSettings, "enabledModels")) {
+      return { key: "global", source: "global", editable: true };
+    }
+    const workspace = canonicalizeStoredCwd(session.sessionManager.getCwd());
+    return { key: `workspace:${workspace}`, source: "workspace", editable: false };
+  }
+
+  /**
+   * Read the effective scope for one settings domain. Global sessions share one
+   * snapshot; project-overridden sessions share a snapshot keyed by workspace.
+   * Neither path enumerates or mutates other active sessions.
+   */
+  private async modelScopeSnapshot(session: PiAgentSession, context = this.modelScopeContext(session)): Promise<ModelScopeSnapshot> {
+    const existing = this.modelScopeStates.get(context.key);
+    if (existing !== undefined) return existing;
+    const pending = this.modelScopeInitializations.get(context.key);
+    if (pending !== undefined) return pending;
+    const initialization = (async () => {
+      const enabledIds = await resolveEnabledModelIds(sessionScopeSource(session));
+      const snapshot: ModelScopeSnapshot = {
+        enabledIds: enabledIds === null ? null : [...enabledIds],
+        revision: 0,
+      };
+      this.modelScopeStates.set(context.key, snapshot);
+      return snapshot;
+    })();
+    this.modelScopeInitializations.set(context.key, initialization);
+    try {
+      return await initialization;
+    } finally {
+      if (this.modelScopeInitializations.get(context.key) === initialization) this.modelScopeInitializations.delete(context.key);
+    }
+  }
+
+  /**
+   * Project one settings-domain scope into one SDK session only when that
+   * session is used. `PiAgentSession` needs an in-memory array for cycling, but
+   * that array is a cache; the keyed snapshot above is the source of truth.
+   */
+  private async synchronizeSessionModelScope(session: PiAgentSession, available: readonly AgentModel[]): Promise<void> {
+    const context = this.modelScopeContext(session);
+    const snapshot = await this.modelScopeSnapshot(session, context);
+    const catalogKey = available.map(modelScopeId).join("\0");
+    const cached = this.modelScopeCache.get(session);
+    if (cached?.scopeKey === context.key && cached.revision === snapshot.revision && cached.catalogKey === catalogKey) return;
+    session.setScopedModels(scopedModelsFromEnabledIds(available, snapshot.enabledIds, session.scopedModels));
+    this.modelScopeCache.set(session, { scopeKey: context.key, revision: snapshot.revision, catalogKey });
+  }
+
+  /**
+   * The models a session may pick from: its synchronized scoped set when
+   * model-scoped, otherwise the runtime's available snapshot. Refreshes the
+   * shared runtime catalog first so callers see newly configured providers and
+   * models. The refresh stays local (`allowNetwork: false`); network refreshes
+   * belong to the bounded background catalog refresher, not this request path.
    */
   private async sessionModelCandidates(session: PiAgentSession): Promise<readonly AgentModel[]> {
     await session.modelRuntime.refresh({ allowNetwork: false });
+    const available = session.modelRuntime.getAvailableSnapshot();
+    await this.synchronizeSessionModelScope(session, available);
     return session.scopedModels.length > 0
       ? session.scopedModels.map((scoped) => scoped.model)
-      : session.modelRuntime.getAvailableSnapshot();
+      : available;
+  }
+
+  /**
+   * The session machine's full available catalog with per-model enabled state,
+   * ordered enabled-first for scope semantics while retaining each model's
+   * natural catalog index for stable picker placement. The enabled state comes
+   * from the keyed scope snapshot rather than a session-local SettingsManager.
+   */
+  private async enabledModelCatalog(session: PiAgentSession): Promise<EnabledModelCatalogEntry<AgentModel>[]> {
+    await session.modelRuntime.refresh({ allowNetwork: false });
+    const available = session.modelRuntime.getAvailableSnapshot();
+    await this.synchronizeSessionModelScope(session, available);
+    const context = this.modelScopeContext(session);
+    const enabledIds = (await this.modelScopeSnapshot(session, context)).enabledIds;
+    return catalogWithEnabledFirst(available, enabledIds);
+  }
+
+  private runModelScopeMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const queued = this.modelScopeMutationQueue.then(operation);
+    this.modelScopeMutationQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  /** Persist one global enabled-model selection and publish its new revision. */
+  private applyEnabledModelScope(
+    session: PiAgentSession,
+    available: readonly AgentModel[],
+    enabledIds: readonly string[] | null,
+  ): void {
+    const availableIds = available.map(modelScopeId);
+    const persisted = persistedEnabledModelPatterns(enabledIds, availableIds);
+    const nextState: ModelScopeSnapshot = {
+      // Pi normalizes a scope covering the complete current catalog to an
+      // omitted setting, which is the global canonical all-enabled state.
+      enabledIds: persisted === undefined ? null : enabledIds === null ? [] : [...enabledIds],
+      revision: ++this.modelScopeRevision,
+    };
+    session.settingsManager.setEnabledModels(persisted);
+    this.modelScopeStates.set("global", nextState);
+    session.setScopedModels(scopedModelsFromEnabledIds(available, nextState.enabledIds, session.scopedModels));
+    this.modelScopeCache.set(session, {
+      scopeKey: "global",
+      revision: nextState.revision,
+      catalogKey: available.map(modelScopeId).join("\0"),
+    });
+    this.events.publishGlobal({ type: "models.changed", revision: nextState.revision });
   }
 
   /**
@@ -1904,6 +2268,67 @@ export class PiSessionService implements SessionRouteService {
     return models.map(modelToClientModel);
   }
 
+  async modelCatalog(ref: PiSessionRef): Promise<ClientSessionModelCatalogEntry[]> {
+    const session = await this.getOrOpen(ref);
+    const scope = this.modelScopeContext(session);
+    return (await this.enabledModelCatalog(session)).map((entry) => catalogEntryToClientModel(entry, scope.editable));
+  }
+
+  /**
+   * Add/remove one model to/from the global pi `enabledModels` scope. A
+   * workspace `.pi/settings.json` override remains authoritative for that
+   * workspace and is intentionally read-only in this picker.
+   */
+  async setModelEnabled(ref: PiSessionRef, provider: string, modelId: string, enabled: boolean): Promise<ClientSessionModelCatalogEntry[]> {
+    await this.assertWritable(ref);
+    const session = await this.getOrOpen(ref);
+    return this.runModelScopeMutation(async () => {
+      const scope = this.modelScopeContext(session);
+      if (scope.source !== "global") throw new Error("Model availability is controlled by this workspace's .pi/settings.json");
+      this.assertTreeNavigationInactive(session, "change enabled models");
+      await session.modelRuntime.refresh({ allowNetwork: false });
+      const currentIds = (await this.modelScopeSnapshot(session, scope)).enabledIds;
+      const available = session.modelRuntime.getAvailableSnapshot();
+      const availableIds = available.map(modelScopeId);
+      const targetId = `${provider}/${modelId}`;
+      if (!availableIds.includes(targetId)) throw new Error(`Model not found: ${targetId}`);
+      if (!enabled && session.model !== undefined && modelScopeId(session.model) === targetId) {
+        throw new Error("Current model cannot be disabled");
+      }
+      const nextIds = applyEnabledModelToggle(currentIds, availableIds, targetId, enabled);
+      this.assertTreeNavigationInactive(session, "change enabled models");
+      if (nextIds !== currentIds) this.applyEnabledModelScope(session, available, nextIds);
+      // Respond from a fresh post-edit read so the response is exactly what
+      // GET models/catalog returns after the edit, including pi's normalizations.
+      return (await this.enabledModelCatalog(session)).map((entry) => catalogEntryToClientModel(entry));
+    });
+  }
+
+  /** Atomically expose every model or narrow the global enabled scope to the current model. */
+  async setModelScope(ref: PiSessionRef, mode: SessionModelScopeMode): Promise<ClientSessionModelCatalogEntry[]> {
+    await this.assertWritable(ref);
+    const session = await this.getOrOpen(ref);
+    return this.runModelScopeMutation(async () => {
+      const scope = this.modelScopeContext(session);
+      if (scope.source !== "global") throw new Error("Model availability is controlled by this workspace's .pi/settings.json");
+      this.assertTreeNavigationInactive(session, "change enabled models");
+      await session.modelRuntime.refresh({ allowNetwork: false });
+      const available = session.modelRuntime.getAvailableSnapshot();
+      const availableIds = available.map(modelScopeId);
+      let nextIds: readonly string[] | null = null;
+      if (mode === "current") {
+        const current = session.model;
+        if (current === undefined || !availableIds.includes(modelScopeId(current))) {
+          throw new Error("Current model is unavailable");
+        }
+        nextIds = [modelScopeId(current)];
+      }
+      this.assertTreeNavigationInactive(session, "change enabled models");
+      this.applyEnabledModelScope(session, available, nextIds);
+      return (await this.enabledModelCatalog(session)).map((entry) => catalogEntryToClientModel(entry));
+    });
+  }
+
   async setModel(ref: PiSessionRef, provider: string, modelId: string): Promise<ClientSessionStatus> {
     await this.assertWritable(ref);
     const session = await this.getOrOpen(ref);
@@ -1922,7 +2347,11 @@ export class PiSessionService implements SessionRouteService {
   async cycleModel(ref: PiSessionRef, direction: "forward" | "backward"): Promise<ClientSessionStatus> {
     await this.assertWritable(ref);
     const session = await this.getOrOpen(ref);
-    const result = await this.runSessionEntryMutation(session, "change models", () => session.cycleModel(direction));
+    const result = await this.runModelScopeMutation(async () => {
+      await session.modelRuntime.refresh({ allowNetwork: false });
+      await this.synchronizeSessionModelScope(session, session.modelRuntime.getAvailableSnapshot());
+      return this.runSessionEntryMutation(session, "change models", () => session.cycleModel(direction));
+    });
     if (result === undefined) throw new Error(session.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available");
     this.publishActivity(session, `model: ${result.model.id}`, "idle", result.model.provider);
     this.publishStatus(session);
@@ -3722,6 +4151,22 @@ function modelToClientModel(model: PiAgentSession["model"]): ClientSessionModel 
     ...(name === undefined ? {} : { name }),
     contextWindow: model.contextWindow,
     ...(reasoning === undefined ? {} : { reasoning }),
+  };
+}
+
+/** The scope source pi's enabled-id precedence reads from: live scope, settings patterns, runtime catalog. */
+function sessionScopeSource(session: PiAgentSession): { settingsManager: PiAgentSession["settingsManager"]; modelRuntime: PiAgentSession["modelRuntime"]; scopedModels: PiAgentSession["scopedModels"] } {
+  return { settingsManager: session.settingsManager, modelRuntime: session.modelRuntime, scopedModels: session.scopedModels };
+}
+
+function catalogEntryToClientModel(entry: EnabledModelCatalogEntry<AgentModel>, editable = true): ClientSessionModelCatalogEntry {
+  return {
+    ...modelToClientModel(entry.model),
+    provider: entry.model.provider,
+    id: entry.model.id,
+    enabled: entry.enabled,
+    catalogIndex: entry.catalogIndex,
+    ...(editable ? {} : { editable: false }),
   };
 }
 

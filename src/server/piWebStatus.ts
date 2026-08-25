@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DefaultPackageManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { DefaultPackageManager, SettingsManager, VERSION as PI_CODING_AGENT_VERSION } from "@earendil-works/pi-coding-agent";
 import type { ActiveAgentProfileDescriptor, PiWebCapability, PiWebComponentStatus, PiWebDeprecatedAgentInput, PiWebInstallationInfo, PiWebReleaseStatus, PiWebRuntimeComponent, PiWebRuntimeResponse, PiWebServiceComponent, PiWebStatusMessage, PiWebStatusResponse, PiWebVersionResponse } from "../shared/apiTypes.js";
 import { effectivePiWebCapabilities, WEB_RUNTIME_CAPABILITIES } from "../shared/capabilities.js";
 import { piWebDockerCommand } from "../docker/piWebDockerCommandPlan.js";
@@ -89,6 +89,7 @@ export function getPiWebRuntimeComponent(component: PiWebServiceComponent, capab
     component,
     label: component === "web" ? "Web/UI" : "Session daemon",
     runtimeVersion: runtimePackageInfo?.version ?? DEFAULT_VERSION,
+    piVersion: PI_CODING_AGENT_VERSION,
     available: true,
     capabilities: [...capabilities],
     ...(deprecatedAgentInputs.length === 0 ? {} : { deprecatedAgentInputs }),
@@ -147,6 +148,7 @@ export async function getPiWebComponentStatus(component: PiWebServiceComponent, 
     label: component === "web" ? "Web/UI" : "Session daemon",
     runtimeVersion,
     ...(installedVersion === undefined ? {} : { installedVersion }),
+    piVersion: PI_CODING_AGENT_VERSION,
     stale: isInstalledVersionNewer(installedVersion, runtimeVersion),
     available: true,
     installation,
@@ -292,7 +294,11 @@ async function detectPiPackageInstallation(realRoot: string, displayPath: string
       const installedPath = configuredPackage.installedPath ?? packageManager.getInstalledPath(configuredPackage.source, configuredPackage.scope);
       if (installedPath === undefined) continue;
       const realInstalledPath = await realPathOrSelf(installedPath);
-      if (isSameOrWithin(realInstalledPath, realRoot) || isSameOrWithin(realRoot, realInstalledPath)) {
+      // PI WEB is a Pi package only when its own root is the installed package or
+      // sits inside it. The reverse never holds: a package vendored *inside* the
+      // checkout (PI WEB ships one at dist/pi-packages/relays) is a payload PI WEB
+      // carries, not the installation PI WEB was delivered by.
+      if (isSameOrWithin(realInstalledPath, realRoot)) {
         return { kind: "pi-package", path: displayPath, source: configuredPackage.source, scope: configuredPackage.scope };
       }
     }
@@ -362,6 +368,11 @@ async function getSessiondComponentStatus(daemon: PiWebStatusDaemon, options: Pi
     return {
       ...status,
       ...(runtimeVersion === undefined ? {} : { runtimeVersion }),
+      // The daemon reports the Pi version it has loaded in its own process;
+      // the spread of `status` already carries this process's Pi version as
+      // the fallback for daemons that predate Pi version reporting, mirroring
+      // the runtimeVersion fallback.
+      ...(runtime.piVersion === undefined ? {} : { piVersion: runtime.piVersion }),
       stale: isInstalledVersionNewer(status.installedVersion, runtimeVersion),
       available: true,
     };

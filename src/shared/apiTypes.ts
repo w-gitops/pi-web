@@ -289,6 +289,25 @@ export interface PiPackageInfo {
 
 export interface PiPackagesResponse {
   packages: PiPackageInfo[];
+  /**
+   * Known Pi packages PI WEB ships and can auto-install (see the
+   * `relay-pi-package-autoinstall` relay) that are not currently configured
+   * for the active profile — omitted or empty once every known package is
+   * configured. Lets the Settings UI offer a one-click (re)install with no
+   * path typing for a package the user dismissed or never installed.
+   */
+  installableKnownPackages?: PiPackageInstallableSuggestion[];
+}
+
+export interface PiPackageInstallableSuggestion {
+  /** The package's own declared `name` (e.g. `@jmfederico/pi-relay`). */
+  id: string;
+  /** Short human-friendly name for display. */
+  label: string;
+  /** Short human-friendly description for display. */
+  description: string;
+  /** Shipped local install source for a one-click install; installs at Pi's default (`user`) scope, same as the free-text install form. */
+  source: string;
 }
 
 export interface PiPackageInstallRequest {
@@ -347,6 +366,19 @@ export interface WorkspaceEffectiveConfig {
 export interface WorkspaceRemovalHostState extends WorkspaceRemovalPresentation {
   /** Opaque token binding a removal confirmation to this exact owner snapshot. */
   readonly precondition: string;
+}
+
+/**
+ * Per-project Pi trust state for a workspace path, as stored in the agent
+ * directory's `trust.json` (shared with the Pi CLI).
+ */
+export interface WorkspaceTrustResponse {
+  /** The workspace path the decision is keyed on. */
+  path: string;
+  /** Raw stored decision: `true`/`false` for an explicit entry, `null` when unset. */
+  decision: boolean | null;
+  /** Effective trust the toggle reflects: the stored decision, else `defaultProjectTrust === "always"`. */
+  trusted: boolean;
 }
 
 export interface WorkspaceRemovalRequest {
@@ -933,6 +965,40 @@ export interface SessionModel {
   reasoning?: unknown;
 }
 
+/**
+ * One row of a session machine's full available-model catalog: the model plus
+ * its membership in pi's effective enabled-models scope (`enabledModels`
+ * setting). Model scope is selection UX for picking/cycling, never an
+ * authorization boundary. Workspace overrides mark rows non-editable because
+ * PI WEB's picker writes only the global setting.
+ */
+export interface SessionModelCatalogEntry {
+  provider: string;
+  id: string;
+  name?: string;
+  contextWindow?: number;
+  reasoning?: unknown;
+  enabled: boolean;
+  /** False when a workspace `.pi/settings.json` override controls membership and the global picker is read-only. */
+  editable?: boolean;
+  /** Stable zero-based position in the machine's unscoped catalog. Optional for compatibility with older servers. */
+  catalogIndex?: number;
+}
+
+/**
+ * The session machine's full available model catalog with per-model enabled
+ * state. Enabled models come first — in the same set and order as the
+ * session's pickable ("Enabled") model list — followed by the remaining
+ * models in catalog order. Each row's `catalogIndex` preserves its natural
+ * unscoped position independently of this enabled-first response order.
+ */
+export interface SessionModelCatalogResponse {
+  models: SessionModelCatalogEntry[];
+}
+
+/** Canonical model-scope presets exposed by the model picker's bulk toggle. */
+export type SessionModelScopeMode = "all" | "current";
+
 // Domain type is owned by pi and re-exported from the shared thinking-levels
 // module. Wire/data fields below intentionally use `string` so an unknown level
 // from a newer pi runtime parses and renders gracefully instead of failing.
@@ -1089,6 +1155,8 @@ export interface PiWebRuntimeComponent {
   component: PiWebServiceComponent;
   label: string;
   runtimeVersion?: string;
+  /** Version of the Pi coding agent library loaded by this component's process; omitted when the component does not report it. */
+  piVersion?: string;
   available: boolean;
   capabilities: PiWebCapability[];
   /** Present only for a session daemon that supports active-profile reporting. */
@@ -1245,9 +1313,16 @@ type SessionUiEventBody =
   | { type: "session.created"; session: SessionInfo }
   | { type: "pi.event"; eventType: string };
 
+/** Global invalidation for the daemon-owned enabled-model scope. */
+export interface ModelScopeChangedEvent {
+  type: "models.changed";
+  revision: number;
+}
+
 export type GlobalSessionEvent =
   | Extract<SessionUiEventBody, { type: "status.update" | "activity.update" | "session.name" | "session.created" }>
   | SessionNotificationSummaryEvent
   | SessionUnreadEvent
-  | SessionStartupProgressEvent;
+  | SessionStartupProgressEvent
+  | ModelScopeChangedEvent;
 export type RealtimeEvent = GlobalSessionEvent | TerminalUiEvent | MachineStatusUiEvent;

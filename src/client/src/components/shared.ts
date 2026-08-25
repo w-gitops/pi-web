@@ -2,6 +2,11 @@ import { css, svg, type TemplateResult } from "lit";
 import type { AskUserOutcome } from "../../../shared/apiTypes";
 import type { SessionWarningSeverity } from "../api";
 
+/** Shared downstream shadow for content passing beneath sticky scroll controls. */
+export const scrollHideShadow = css`0 8px 18px var(--pi-shadow-soft)`;
+/** Directional navigation shadow that avoids a halo above the fixed heading edge. */
+export const scrollBoundaryShadow = css`0 8px 18px -8px var(--pi-shadow-soft)`;
+
 export function renderSessionWarningIcon(severity: SessionWarningSeverity, className: string): TemplateResult {
   if (severity === "error") {
     return svg`
@@ -234,6 +239,7 @@ export const listStyles = css`
   :host([collapsed]) { flex: 0 0 auto; min-height: auto; overflow: hidden; }
   section { box-sizing: border-box; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; padding: 10px; }
   h2 { flex: 0 0 auto; display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 0 0 8px; color: var(--pi-muted); font-size: 12px; text-transform: uppercase; }
+  section > h2 { position: relative; z-index: 3; margin: 0 -10px; padding: 0 10px 8px; background: var(--pi-bg); box-shadow: ${scrollBoundaryShadow}; }
   .list-body { flex: 1 1 auto; min-height: 0; overflow: auto; }
   button { border: 1px solid var(--pi-border); border-radius: 8px; background: var(--pi-surface); color: var(--pi-text); padding: 7px 9px; cursor: pointer; }
   section > button { display: block; width: 100%; text-align: left; margin: 6px 0; }
@@ -419,7 +425,7 @@ export const chatStyles = css`
   .session-activity span, .session-activity small { color: var(--pi-muted); }
   .history-boundary small { color: var(--pi-dim); }
   .msg-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 22px; margin-bottom: 8px; }
-  .msg > .msg-header { position: sticky; top: -26px; z-index: 4; margin: -12px -12px 8px; padding: 7px 10px 6px; border-radius: 9px 9px 0 0; border-bottom: 1px solid color-mix(in srgb, var(--pi-border-muted) 35%, transparent); background: var(--pi-surface); box-shadow: 0 8px 18px var(--pi-shadow-soft); }
+  .msg > .msg-header { position: sticky; top: -26px; z-index: 4; margin: -12px -12px 8px; padding: 7px 10px 6px; border-radius: 9px 9px 0 0; border-bottom: 1px solid color-mix(in srgb, var(--pi-border-muted) 35%, transparent); background: var(--pi-surface); box-shadow: ${scrollHideShadow}; }
   .msg.user > .msg-header { border-bottom-color: color-mix(in srgb, var(--pi-accent-border) 35%, transparent); background: var(--pi-selection-bg); }
   .msg.assistant > .msg-header .label, .msg.tool-image-output > .msg-header .label { color: var(--pi-text-secondary); }
   .msg.user > .msg-header .label { color: var(--pi-accent); }
@@ -542,6 +548,14 @@ export const promptEditorStyles = css`
   .markdown-editor .cm-line { padding: 0; unicode-bidi: plaintext; }
   .markdown-editor .cm-placeholder { color: var(--pi-dim); }
   .markdown-editor .cm-focused { outline: none; }
+  /* drawSelection() renders the caret and selection itself, and CodeMirror's
+     base colors for them assume a light editor (black caret, pale selection).
+     Re-theme them so they stay readable in every pi-web theme. The focused
+     selection rule must outspecify CodeMirror's base rule for the focused
+     selection background. */
+  .markdown-editor .cm-cursor { border-left-color: var(--pi-text); }
+  .markdown-editor .cm-editor .cm-selectionBackground { background: color-mix(in srgb, var(--pi-text) 18%, transparent); }
+  .markdown-editor .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground { background: color-mix(in srgb, var(--pi-accent) 32%, transparent); }
   .shell-mode textarea, .shell-mode .markdown-editor .cm-editor { border-color: var(--pi-success); box-shadow: 0 0 0 1px var(--pi-success-ring); }
   .mode-hint { position: absolute; right: 46px; bottom: 8px; max-width: calc(100% - 54px); border: 1px solid var(--pi-success-border); border-radius: 999px; background: var(--pi-success-surface); color: var(--pi-success); padding: 2px 8px; font-size: 12px; pointer-events: none; }
   .attachments { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }

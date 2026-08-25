@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { VERSION as PI_CODING_AGENT_VERSION } from "@earendil-works/pi-coding-agent";
 import { comparePackageVersions, getPiWebRuntime, getPiWebStatus, getPiWebVersionStatus, updateCommandFor } from "./piWebStatus.js";
 import { SessionDaemonClient } from "../sessiond/sessionDaemonClient.js";
 import type { PiWebRuntimeComponent } from "../shared/apiTypes.js";
@@ -46,6 +47,26 @@ describe("PI WEB status", () => {
     expect(status).not.toHaveProperty("release");
   });
 
+  it("reports the loaded Pi version for each component, preferring the daemon report", async () => {
+    const daemon = daemonWithRuntime({ ...runningSessiondRuntime(), piVersion: "0.83.0" });
+
+    const status = await getPiWebVersionStatus(daemon);
+    const runtime = await getPiWebRuntime(daemon);
+
+    expect(status.components.web.piVersion).toBe(PI_CODING_AGENT_VERSION);
+    expect(status.components.sessiond.piVersion).toBe("0.83.0");
+    expect(runtime.components.web.piVersion).toBe(PI_CODING_AGENT_VERSION);
+    expect(runtime.components.sessiond.piVersion).toBe("0.83.0");
+  });
+
+  it("falls back to this process's Pi version when the daemon predates Pi version reporting", async () => {
+    const daemon = daemonWithRuntime(runningSessiondRuntime());
+
+    const status = await getPiWebVersionStatus(daemon);
+
+    expect(status.components.sessiond.piVersion).toBe(PI_CODING_AGENT_VERSION);
+  });
+
   it("detects session daemon package installs from the configured agent dir for runtime responses", async () => {
     disableDockerRuntimeEnv();
     const agentDir = await tempHome();
@@ -62,6 +83,28 @@ describe("PI WEB status", () => {
       const status = await getPiWebVersionStatus(daemon, { activeAgentProfile: activeProfile(agentDir) });
 
       expect(status.components.sessiond.installation).toMatchObject({ kind: "pi-package", source: process.cwd(), scope: "user" });
+    } finally {
+      await rm(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a local checkout local when a configured Pi package is vendored inside it", async () => {
+    disableDockerRuntimeEnv();
+    const agentDir = await tempHome();
+    try {
+      await installConfiguredPiWebPackage(agentDir, join(process.cwd(), "dist", "pi-packages", "relays"));
+      const daemon = daemonWithRuntime({
+        component: "sessiond",
+        label: "Session daemon",
+        runtimeVersion: "1.202605.7",
+        available: true,
+        capabilities: [],
+      });
+
+      const status = await getPiWebVersionStatus(daemon, { activeAgentProfile: activeProfile(agentDir) });
+
+      expect(status.components.web.installation?.kind).not.toBe("pi-package");
+      expect(status.components.sessiond.installation?.kind).not.toBe("pi-package");
     } finally {
       await rm(agentDir, { recursive: true, force: true });
     }
@@ -495,8 +538,8 @@ async function installSystemdServiceFiles(home: string, names: string[]): Promis
   await Promise.all(names.map((name) => writeFile(join(dir, name), "")));
 }
 
-async function installConfiguredPiWebPackage(agentDir: string): Promise<void> {
-  await writeFile(join(agentDir, "settings.json"), `${JSON.stringify({ packages: [process.cwd()] }, null, 2)}\n`, "utf8");
+async function installConfiguredPiWebPackage(agentDir: string, packagePath: string = process.cwd()): Promise<void> {
+  await writeFile(join(agentDir, "settings.json"), `${JSON.stringify({ packages: [packagePath] }, null, 2)}\n`, "utf8");
 }
 
 async function installExecutable(dir: string, name: string): Promise<void> {
