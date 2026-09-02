@@ -1,7 +1,7 @@
-// @vitest-environment happy-dom
+/* @vitest-environment happy-dom */
+import { describe, expect, it, vi, afterEach } from "vitest";
 import { render } from "lit";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { errorBanner } from "./errorBanner";
+import { errorBanner, type ErrorBannerOption } from "./errorBanner";
 
 afterEach(() => {
   document.body.replaceChildren();
@@ -10,30 +10,29 @@ afterEach(() => {
 function renderBanner(
   error: string,
   onDismiss = vi.fn(),
-  action?: { label: string; onClick: () => void },
+  option?: ErrorBannerOption,
 ): { host: HTMLElement; onDismiss: ReturnType<typeof vi.fn> } {
   const host = document.createElement("div");
   document.body.append(host);
-  render(errorBanner(error, onDismiss, action), host);
+  render(errorBanner(error, onDismiss, option), host);
   return { host, onDismiss };
 }
 
 describe("errorBanner", () => {
-  it("renders nothing when there is no error", () => {
-    const { host } = renderBanner("");
+  it("renders nothing for an empty error", () => {
+    const host = document.createElement("div");
+    render(errorBanner("", vi.fn()), host);
 
-    expect(host.querySelector(".error")).toBeNull();
+    expect(host.innerHTML).toBe("<!---->");
   });
 
-  it("announces the message and dismisses it on request", () => {
-    const { host, onDismiss } = renderBanner("Failed to start workspace removal: HTTP request cancelled");
+  it("renders a dismissible error banner", () => {
+    const { host, onDismiss } = renderBanner("Something failed");
 
-    const banner = host.querySelector(".error");
-    expect(banner?.getAttribute("role")).toBe("alert");
-    expect(banner?.textContent).toContain("Failed to start workspace removal: HTTP request cancelled");
-
+    expect(host.querySelector(".error")?.textContent).toContain("Something failed");
     const dismiss = host.querySelector<HTMLButtonElement>(".error-dismiss");
     expect(dismiss?.getAttribute("aria-label")).toBe("Dismiss error");
+
     dismiss?.click();
 
     expect(onDismiss).toHaveBeenCalledTimes(1);
@@ -70,5 +69,13 @@ describe("errorBanner", () => {
 
     expect(host.querySelector(".error-dismiss")).toBeNull();
     expect(host.querySelector<HTMLButtonElement>(".error-action")?.textContent).toBe("Reauthenticate");
+  });
+
+  it.each(["info", "warning"] as const)("uses the severity-aware presentation for %s notices", (severity) => {
+    const { host } = renderBanner("Server notice", vi.fn(), severity);
+    const banner = host.querySelector(".error");
+
+    expect(banner?.classList.contains(severity)).toBe(true);
+    expect(banner?.querySelector(".error-dismiss")?.getAttribute("aria-label")).toBe(`Dismiss ${severity}`);
   });
 });

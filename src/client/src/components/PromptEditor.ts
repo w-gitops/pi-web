@@ -5,7 +5,7 @@ import { drawSelection, EditorView, keymap, placeholder } from "@codemirror/view
 import { defaultHighlightStyle, indentOnInput, indentUnit, syntaxHighlighting } from "@codemirror/language";
 import { LitElement, css, html, type PropertyValues } from "lit";
 import { customElement, property, query, state } from "lit/decorators.js";
-import { api, type FileSuggestion, type PromptAttachment, type SessionModel, type SessionStatus, type SlashCommand } from "../api";
+import { api, DEFAULT_WORKSPACE_ATTACHMENTS_FOLDER, type FileSuggestion, type PromptAttachment, type SessionModel, type SessionStatus, type SlashCommand } from "../api";
 import type { PromptAttachmentDelivery } from "../../../shared/apiTypes";
 import type { PromptDeliveryResult } from "../controllers/sessionController";
 import { capturePromptAttachments, effectivePromptAttachmentDelivery, isInlinePromptAttachment, promptAttachmentsCanUseInlineDelivery } from "../promptAttachmentCapture";
@@ -39,6 +39,12 @@ export class PromptEditor extends LitElement {
   @property() machineId = "local";
   @property() projectId?: string;
   @property() workspaceId?: string;
+  /**
+   * Workspace-effective folder for the "save to folder" attachment delivery.
+   * Shown in the delivery label and sent explicitly with the save request, so
+   * the save destination is always the folder the label advertised.
+   */
+  @property() attachmentsFolder = DEFAULT_WORKSPACE_ATTACHMENTS_FOLDER;
   @property({ type: Boolean }) canSteer = false;
   @property({ type: Boolean }) isCompacting = false;
   @property({ type: Boolean }) canStop = false;
@@ -47,7 +53,7 @@ export class PromptEditor extends LitElement {
   @property({ type: Boolean }) reconnecting = false;
   /** Proxy session expired; send stays blocked until the user reauthenticates. */
   @property({ type: Boolean }) authenticationRequired = false;
-  @property({ attribute: false }) onSend?: (text: string, streamingBehavior?: "steer" | "followUp", attachments?: PromptAttachment[], delivery?: PromptAttachmentDelivery) => PromptDeliveryResult | Promise<PromptDeliveryResult>;
+  @property({ attribute: false }) onSend?: (text: string, streamingBehavior?: "steer" | "followUp", attachments?: PromptAttachment[], delivery?: PromptAttachmentDelivery, folder?: string) => PromptDeliveryResult | Promise<PromptDeliveryResult>;
   @property({ attribute: false }) onStop?: () => void;
   @property({ attribute: false }) onSelectModel?: () => void;
   @property({ attribute: false }) onSelectThinking?: () => void;
@@ -245,7 +251,7 @@ export class PromptEditor extends LitElement {
           <label class="attachment-delivery" title=${canUseInlineDelivery ? "How attachments are delivered to the agent" : "General files are saved and mentioned from the workspace"}>
             <select .value=${delivery} @change=${(event: Event) => { this.changeDelivery(event); }}>
               <option value="inline" ?disabled=${!canUseInlineDelivery}>Attach to message${canUseInlineDelivery ? "" : " (images only)"}</option>
-              <option value="folder">Save to .pi-web/attachments</option>
+              <option value="folder">${attachmentFolderDeliveryLabel(this.attachmentsFolder)}</option>
             </select>
           </label>
         ` : null}
@@ -555,11 +561,15 @@ export class PromptEditor extends LitElement {
     const originKey = draftStorageKey(originMachineId, originSessionId);
     const submittedDraft = this.draft;
     const submittedAttachmentIds = new Set(pending.map((attachment) => attachment.id));
+    // Folder delivery sends the displayed workspace-effective folder explicitly
+    // (the uploads pattern): the save lands exactly where the label pointed,
+    // independent of how the session cwd would resolve its own project config.
+    const folder = attachments !== undefined && delivery === "folder" ? this.attachmentsFolder : undefined;
     this.inFlightComposerKey = originKey;
     this.submitting = true;
     this.deliveryWarning = undefined;
     try {
-      const result = await this.onSend?.(text, behavior, attachments, attachments === undefined ? undefined : delivery);
+      const result = await this.onSend?.(text, behavior, attachments, attachments === undefined ? undefined : delivery, folder);
       if (isPromptDeliveryFailure(result)) {
         this.applyFailedDelivery(originMachineId, originSessionId, originKey, deliveryWarningFor(result.kind));
         return;
@@ -720,6 +730,10 @@ function pendingToPromptAttachment(attachment: PendingAttachment): PromptAttachm
     return { kind: "image", mimeType: attachment.mimeType, data: attachment.data, name: attachment.name };
   }
   return { kind: "file", mimeType: attachment.mimeType, data: attachment.data, name: attachment.name };
+}
+
+export function attachmentFolderDeliveryLabel(folder: string): string {
+  return `Save to ${folder}`;
 }
 
 function fileExtensionLabel(name: string): string {

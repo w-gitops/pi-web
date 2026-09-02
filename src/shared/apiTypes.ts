@@ -137,6 +137,10 @@ export interface PiWebUploadsConfig {
   defaultFolder?: string;
 }
 
+export interface PiWebAttachmentsConfig {
+  defaultFolder?: string;
+}
+
 export interface PiWebAgentConfig {
   /** Deprecated and ignored: the multi-implementation CLI abstraction was removed; sessions always run on the bundled pi SDK. Detected for the deprecation warning. */
   command?: string;
@@ -170,6 +174,8 @@ export interface PiWebConfigValues {
   pathAccess?: PiWebPathAccessConfig;
   /** Workspace-relative defaults for manual file uploads. */
   uploads?: PiWebUploadsConfig;
+  /** Workspace-relative defaults for prompt attachments saved into the workspace. */
+  attachments?: PiWebAttachmentsConfig;
   /** Maximum accepted HTTP request body size in bytes (uploads/attachments). */
   maxUploadBytes?: number;
   /** When true, LLMs can start new sessions via the spawn_session tool. */
@@ -360,6 +366,7 @@ export interface Project {
 
 export interface WorkspaceEffectiveConfig {
   readonly uploads?: Readonly<PiWebUploadsConfig>;
+  readonly attachments?: Readonly<PiWebAttachmentsConfig>;
 }
 
 /** Host-only removal state carried by PI WEB's browser/sessiond protocol. */
@@ -430,6 +437,37 @@ export type WorkspaceProviderAuthorityResolution = Omit<WorkspaceProviderResolut
 export interface SessionRef {
   id: string;
   cwd: string;
+}
+
+export type ServerNoticeSeverity = "info" | "warning" | "error";
+
+/** One independent server-created application event retained until dismissal. */
+export interface ServerNotice {
+  id: string;
+  severity: ServerNoticeSeverity;
+  message: string;
+  createdAt: string;
+  source?: string;
+  context?: JsonObject;
+}
+
+/** Current undismissed server notices for one session-daemon instance. */
+export interface ServerNoticeSnapshot {
+  daemonInstanceId: string;
+  /** Monotonic only for this daemon instance's current notice projection. */
+  revision: number;
+  notices: ServerNotice[];
+}
+
+export interface ServerNoticeDismissRequest {
+  daemonInstanceId: string;
+  noticeId: string;
+}
+
+/** Full current notice projection published on the existing global realtime socket. */
+export interface ServerNoticeEvent {
+  type: "notices.updated";
+  snapshot: ServerNoticeSnapshot;
 }
 
 export const SESSION_UNREAD_LIMIT = 1_000;
@@ -1324,5 +1362,6 @@ export type GlobalSessionEvent =
   | SessionNotificationSummaryEvent
   | SessionUnreadEvent
   | SessionStartupProgressEvent
-  | ModelScopeChangedEvent;
+  | ModelScopeChangedEvent
+  | ServerNoticeEvent;
 export type RealtimeEvent = GlobalSessionEvent | TerminalUiEvent | MachineStatusUiEvent;

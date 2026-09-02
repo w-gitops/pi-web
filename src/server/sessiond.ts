@@ -8,6 +8,9 @@ import { MachineStatusService } from "./status/machineStatusService.js";
 import { registerMachineStatusRoutes } from "./status/machineStatusRoutes.js";
 import { CachedWorkspaceAttribution } from "./status/workspaceAttribution.js";
 import { SessionEventHub } from "./realtime/sessionEventHub.js";
+import { ServerNoticeStore } from "./notices/serverNoticeStore.js";
+import { ServerNoticeService } from "./notices/serverNoticeService.js";
+import { registerServerNoticeRoutes } from "./notices/serverNoticeRoutes.js";
 import { AuthService } from "./sessions/authService.js";
 import { bootstrapAndFreezeGlobalExtensionProviders } from "./sessions/globalProviderPolicy.js";
 import { registerAuthRoutes } from "./sessions/authRoutes.js";
@@ -31,6 +34,7 @@ import { registerTerminalRoutes } from "./terminals/terminalRoutes.js";
 import { getPiWebRuntimeComponent } from "./piWebStatus.js";
 import { SESSIOND_RUNTIME_CAPABILITIES } from "../shared/capabilities.js";
 import { agentSessionDirEnvOverride, effectivePiWebConfig, maxUploadBytes, offlineModeEnabled, PI_CODING_AGENT_DIR_ENV, PI_CODING_AGENT_SESSION_DIR_ENV } from "../config.js";
+import { createFilePiWebConfigService } from "./configRoutes.js";
 import { createActiveAgentProfileDescriptor } from "../sessiond/activeAgentProfile.js";
 import { loadServerPluginRecoveryConfig } from "../serverPluginRecovery.js";
 import { DefaultPiPackageProvider, PiWebPluginCatalog } from "./piWebPluginCatalog.js";
@@ -60,6 +64,10 @@ const telemetry = await startNodeTelemetry("pi-web-sessiond");
 const daemonEnvironment: NodeJS.ProcessEnv = Object.freeze({ ...process.env });
 const serverPluginRecovery = loadServerPluginRecoveryConfig({ env: daemonEnvironment });
 const { config, deprecatedAgentInputs } = effectivePiWebConfig({ env: daemonEnvironment });
+// The session service re-reads the config file at request time (e.g. for the
+// attachments default folder), so Settings edits apply without a daemon
+// restart; the daemon's own startup toggles keep using the snapshot above.
+const configService = createFilePiWebConfigService({ env: daemonEnvironment });
 const activeAgentProfile = createActiveAgentProfileDescriptor(config.agent);
 // Normalize the resolved agent state locations into the canonical pi SDK env
 // vars before anything agent-visible can spawn: the embedded SDK's own
@@ -195,6 +203,7 @@ async function createSessionDaemonRuntime() {
   });
   try {
     const eventHub = new SessionEventHub();
+    const serverNotices = new ServerNoticeService(new ServerNoticeStore(), eventHub);
     const notificationStore = new SessionNotificationStore();
     const unreadStore = new SessionUnreadStore({
       persistence: new FileSessionUnreadPersistence(defaultSessionUnreadFilePath(daemonEnvironment)),
@@ -266,6 +275,7 @@ async function createSessionDaemonRuntime() {
       ...(spawnTargets === undefined ? {} : { spawnTargets }),
       subsessionsEnabled: config.subsessions,
       askUserEnabled: config.askUser,
+      config: configService,
       appendSystemPromptSections: [
         // Sessions always run nested in this daemon, so they always get the
         // session environment facts; Docker deployments add their container
@@ -293,8 +303,8 @@ async function createSessionDaemonRuntime() {
       }),
     }));
     auth.subscribe((change) => { sessions.applyAuthChange(change); });
-    const terminals = new TerminalService(eventHub, workspaceActivity);
-    const workspaceRemovals = new WorkspaceRemovalService(workspaceProviders, terminals);
+    const terminals = new TerminalService(eventHub, workspaceActivity, serverNotices);
+    const workspaceRemovals = new WorkspaceRemovalService(workspaceProviders, terminals, { notices: serverNotices });
     const runtimeComponent = Object.freeze({
       // The deprecated-input report is fixed at startup: it was detected from
       // the captured pre-scrub daemon environment and the config snapshot this
@@ -326,7 +336,7 @@ async function createSessionDaemonRuntime() {
       // next start discards it.
       await stateOwnership.release();
     };
-    return { eventHub, machineStatus, statusAttribution, auth, sessions, terminals, unreadStore, activeAgentProfile, runtimeComponent, catalogRefresher, serverPlugins, projects, workspaceProviders, workspaceProviderRuntime, workspaceRemovals, shutdown };
+    return { eventHub, machineStatus, statusAttribution, auth, sessions, terminals, serverNotices, unreadStore, activeAgentProfile, runtimeComponent, catalogRefresher, serverPlugins, projects, workspaceProviders, workspaceProviderRuntime, workspaceRemovals, shutdown };
   } catch (error) {
     try {
       await serverPlugins.stop();
@@ -337,8 +347,9 @@ async function createSessionDaemonRuntime() {
   }
 }
 
-function registerSessionDaemonRoutes({ eventHub, machineStatus, statusAttribution, auth, sessions, terminals, runtimeComponent, projects, workspaceProviders, workspaceProviderRuntime, workspaceRemovals }: SessionDaemonRuntime): void {
+function registerSessionDaemonRoutes({ eventHub, machineStatus, statusAttribution, auth, sessions, terminals, serverNotices, runtimeComponent, projects, workspaceProviders, workspaceProviderRuntime, workspaceRemovals }: SessionDaemonRuntime): void {
   registerMachineStatusRoutes(app, machineStatus);
+  registerServerNoticeRoutes(app, serverNotices);
   registerAuthRoutes(app, auth);
   registerSessionRoutes(app, sessions, eventHub);
   registerTerminalRoutes(app, terminals);

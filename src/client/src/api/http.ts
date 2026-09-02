@@ -15,6 +15,15 @@ const DEFAULT_API_REQUEST_TELEMETRY: ApiRequestTelemetry = {
 const AUTHENTIK_OUTPOST_PREFIX = "/outpost.goauthentik.io";
 const REAUTH_HEADER = "x-pi-web-reauth";
 
+/** A response-backed API failure, retaining the status needed at an ownership boundary. */
+export class HttpRequestError extends Error {
+  override name = "HttpRequestError";
+
+  constructor(message: string, readonly status: number, options: ErrorOptions = {}) {
+    super(message, options);
+  }
+}
+
 /**
  * Proxy authentication has expired or is missing. Carries no response bodies,
  * URLs, prompt text, or credentials — only a stable, user-safe message.
@@ -47,7 +56,7 @@ export async function request<T>(url: string, parse: (value: unknown) => T, init
   return apiRequest(url, operation, init, async (response) => {
     if (!response.ok) {
       const body: unknown = await response.json().catch((): unknown => ({}));
-      throw new Error(errorMessage(body) ?? response.statusText);
+      throw new HttpRequestError(errorMessage(body) ?? response.statusText, response.status);
     }
     const body: unknown = await response.json();
     return parse(body);
