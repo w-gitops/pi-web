@@ -1,5 +1,37 @@
 # @jmfederico/pi-web
 
+## 1.202609.0
+
+### Patch Changes
+
+- c34b0a3: Add an `attachments.defaultFolder` config key to customize where chat-composer prompt attachments are saved, mirroring `uploads.defaultFolder`: set it in the global config file or Settings → General for the selected machine, override it per project in `<project>/.pi-web/config.json`, and see the workspace-effective folder in the composer's "Save to …" delivery option. Without configuration, attachments are still saved to `.pi-web/attachments`, and an explicit per-request folder keeps winning over the configured default.
+- 9ce008b: Make the running instance identifiable at a glance where no browser chrome helps. In an installed PWA window, the header shows a machine control: a dropdown listing every machine with its own favicon (dimmed when offline) when a choice exists, or a static bubble with the instance favicon and gateway address when only the local machine exists; the mobile breadcrumb leads with a Machine chip carrying the same identity. In a regular browser tab the location indicators stay hidden and the machine control remains a pure selector. Development deployments (Docker dev mode or a source checkout) recolor the favicon and PWA icons purple and install the PWA as "PI WEB (dev)".
+- 61c4684: Add `interactive-widget=resizes-content` to the viewport meta so Chromium-based mobile browsers resize the layout viewport while the on-screen keyboard is open, keeping the prompt composer visible above the keyboard. Browsers that ignore the directive keep their current behaviour.
+- 24e1e22: Support Pi SDK 0.85.x and exclude the broken `@earendil-works/pi-coding-agent` 0.85.0 release from the peer range: its published package could not be loaded at all, which prevented PI WEB from starting. Fresh installs now resolve Pi SDK 0.85.1 or later, while existing 0.84.x installs remain supported. A new package-integrity test also makes this class of upstream packaging defect surface as a single clear test failure during development.
+- c9c06ea: Bound the idle-session transcript snapshot cache so a long-running session daemon no longer accumulates the parsed transcript of every session ever polled; snapshots are now evicted least-recently-used first past a small limit.
+
+  Fix status and message reads for idle sessions whose transcript file does not exist on disk (never persisted yet, or removed externally): they now serve the live runtime branch instead of failing.
+
+  Speed up polling of an idle session whose transcript file keeps growing: when another process appends to the file, only the appended bytes are read and parsed instead of the whole transcript being re-read every few seconds. Any change other than a pure append (replacement, truncation, in-place rewrite) still triggers a full re-read.
+
+  Stop polling of a never-persisted session from rescanning its session directory on every tick: transcript file resolution is now throttled, so an idle in-memory session polls at constant cost while still noticing a transcript file that appears later.
+
+  Stop a failing background poll of the selected session from churning the global error banner every few seconds: automatic poll failures are now only logged, while user-triggered refreshes still report errors.
+
+  Skip redundant work when a poll of the selected session changes nothing: a tick whose messages, status, and in-flight partial all match what is already shown no longer re-merges history, rewrites the cached transcript, or re-renders.
+
+- 2e7fa58: Keep no-summary session-tree navigation on the selected branch and restore active user or custom-message text for editing.
+- d2e74d5: Preserve line breaks and indentation in supporting question and option details shown by `ask_user` forms and transcript records, with supporting text aligned beneath each question and placed closer to it.
+- 7149fe4: Keep selected sessions current when another Pi process appends to their transcript, without replacing active Pi Web runtimes.
+- cf7cb35: Split Relay into a tool-agnostic foundation and an opinionated `relay-runner` software-delivery profile, make `/relay` build reviewable drafts and require explicit approval only before dispatch without pre-planning the chain, keep charters centered on goals and scope edges while project guidance owns quality, retain `/relay-worktree` as a compatibility alias, make handoff the final operational action while allowing a dispatch summary, require review, approval, and delivery before Relay completion, and treat two whole-work review attempts as normal while reserving a third for a justified contingency before human intervention.
+- 5cc9b2a: Keep authentication failures associated with the machine that owns the login or logout operation instead of replacing unrelated global feedback.
+- 31e4120: Keep browser error feedback associated with its workspace or session, and avoid duplicating workspace-removal failures already recorded as server notices while preserving feedback when the session daemon is unavailable.
+- 317418c: Keep machine and project browser failures associated with their owning context instead of replacing unrelated global feedback.
+- dddb9d4: Show server-owned notices only in their relevant project, workspace, or session context.
+- 238e8df: Show failed workspace removals as dismissible server-owned notices that survive browser and API restarts.
+- 88da8a1: Tolerate package-owned global systemd drop-ins when inspecting managed services, so `pi-web install`, `start`, and `doctor` work on stock Fedora and Bluefin (whose `service.d/10-timeout-abort.conf` applies to every user service). Overrides that alter the managed environment still fail closed.
+- 460a04b: Rework the Updates workspace tab so it presents a single prominent action: when an update or restart is available, the recommended command now sits at the top with the status notices folded in as context, installed services stay in the middle, and optional finer-control commands move to the bottom. Notices no longer carry their own command buttons, so the panel never shows two competing recommended actions.
+
 ## 1.202608.2
 
 ### Upgrade warnings
